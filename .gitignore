@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Env & secrets
+.env
+secrets/
+service_account.json
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+
+# Logs / cache
+*.log
+.cache/

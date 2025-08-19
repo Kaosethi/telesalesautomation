@@ -1,0 +1,14 @@
+pandas>=2.2
+python-dotenv>=1.0
+requests>=2.32
+
+# Google Sheets/Drive (service account)
+google-api-python-client>=2.136
+google-auth>=2.31
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.1
+gspread>=6.1.4
+gspread-dataframe>=3.3.1
+
+# Timezone db for Windows
+tzdata>=2024.1
