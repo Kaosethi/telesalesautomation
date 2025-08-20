@@ -2,26 +2,23 @@
 """
 Dry‑run friendly pipeline (mock data flowing to Sheets).
 
-What it does right now
-- Loads config
-- Creates Sheets client (dry‑run if creds/IDs missing)
-- Loads mock "Hot Lead" rows for PC + Mobile
-- Splits Tier A (A-*) vs Non‑A (others)
+Now with windows + re‑query:
+- Loads mock rows for HOT/COLD/HIBERNATED (PC + Mobile)
+- Tier A = HOT only
+- Non‑A = HOT, if short then add COLD, if still short add HIBERNATED
 - Applies Thai drop filters per tier (using this month's Compile; empty in dry‑run)
-- Builds Tier A dataframe (Tier‑A headers, no caller assignment)
-- Builds Non‑A dataframe (13‑col telesales header, Telesale blank for now)
-- Ensures month files/tabs, writes daily tabs, upserts Compile
-- Sends Discord notifications (skips if webhook unset)
+- Writes daily tabs + upserts Compile; sends Discord (skips if webhook unset)
 
-Next steps later
-- Add rules.py (multi‑window merge + re‑query for Non‑A)
-- Add assign.py (mix‑aware caller assignment for Non‑A)
+Next steps:
+- Add Callers reader (from Config sheet) and compute target_rows_non_a
+  = available_callers * PER_CALLER_TARGET
+- Add assign.py for mix‑aware per‑caller distribution (Non‑A only)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict
 import pandas as pd
 from datetime import datetime
 
@@ -34,13 +31,15 @@ from .constants import (
     COL_PHONE, COL_CALLING_CODE, COL_TIER,
     COL_INACTIVE_DAYS, COL_REWARD_RANK, COL_TELESALE,
     COL_AMOUNT, COL_ARK_GEM, COL_REWARD,
-    WINDOW_HOT,
+    WINDOW_HOT, WINDOW_COLD, WINDOW_HIBERNATED,
     is_tier_a,
 )
 from .utils import today_key, normalize_phone, split_calling_code_th, inactive_days
 from .notify import notify_discord
 from .loaders import load_candidates_for_window
 from . import filters
+from . import rules
+
 
 
 @dataclass
@@ -56,20 +55,9 @@ class TierWriteResult:
 # ----------------------------- build dataframes -------------------------------
 
 def _build_tier_a_df(source_rows: pd.DataFrame, ark_gem_col: str) -> pd.DataFrame:
-    """
-    Map raw rows -> Tier A header schema.
-    Columns we fill:
-      No., username, Phone Number, Tier, Inactive Duration (Days),
-      amount, Ark Gem, Reward, Assign Date
-    Notes:
-      - amount: unknown from mock → blank
-      - Ark Gem: pass-through from ark_gem_col if present
-      - Reward: from reward_tier
-    """
     if source_rows is None or source_rows.empty:
         return pd.DataFrame(columns=TIER_A_HEADERS)
 
-    # Normalize phones + inactivity days
     phones = source_rows["phone"].map(normalize_phone)
     inact = source_rows.apply(
         lambda r: inactive_days(
@@ -90,26 +78,13 @@ def _build_tier_a_df(source_rows: pd.DataFrame, ark_gem_col: str) -> pd.DataFram
         COL_REWARD: source_rows.get("reward_tier", ""),
         COL_ASSIGN_DATE: today_key(),
     })
-
-    # Ensure exact column order
     return df[TIER_A_HEADERS]
 
 
 def _build_non_a_df(source_rows: pd.DataFrame) -> pd.DataFrame:
-    """
-    Map raw rows -> Non‑A 13‑column telesales schema.
-    Columns:
-      No., Username, Calling Code, Phone Number, Tier, Inactive Duration (Days),
-      Reward Rank, Telesale, Assign Date, Recall Date/Time, Call Status, Answer Status, Result
-    Notes:
-      - Calling Code / Phone split follows Thai rule (=+66 + local number)
-      - Telesale blank for now (assignment comes later)
-      - Recall/Call/Answer/Result left blank (to be filled by callers later)
-    """
     if source_rows is None or source_rows.empty:
         return pd.DataFrame(columns=NON_A_HEADERS)
 
-    # Normalize phones + split calling code
     local_digits = source_rows["phone"].map(normalize_phone)
     cc, local = zip(*[split_calling_code_th(p) for p in local_digits])
 
@@ -129,14 +104,13 @@ def _build_non_a_df(source_rows: pd.DataFrame) -> pd.DataFrame:
         COL_TIER: source_rows.get("tier", ""),
         COL_INACTIVE_DAYS: inact,
         COL_REWARD_RANK: source_rows.get("reward_tier", ""),
-        COL_TELESALE: "",                   # filled after assignment later
+        COL_TELESALE: "",                   # will fill after assignment later
         COL_ASSIGN_DATE: today_key(),
-        "Recall Date/Time": "",             # left blank for callers
+        "Recall Date/Time": "",
         "Call Status": "",
         "Answer Status": "",
         "Result": "",
     })
-
     return df[NON_A_HEADERS]
 
 
@@ -164,12 +138,12 @@ def _write_tier(sc: SheetsClient, tier_label: str, df: pd.DataFrame) -> TierWrit
 
 def run_mock_hot_only() -> Dict[str, TierWriteResult]:
     """
-    Current skeleton run:
-      - Pulls ONLY Hot Lead for PC+Mobile (mock data)
-      - Split A-* vs Non‑A
-      - Apply filters per tier using this month's Compile (empty in true dry‑run)
-      - Tier A = no caller assignment
-      - Non‑A = no assignment yet (will add later)
+    Mock daily run:
+      - Load HOT/COLD/HIBERNATED for PC & Mobile (mock mode)
+      - Tier A = build_tier_a_pool (HOT only)
+      - Non‑A = build_non_a_pool (re‑query windows toward target)
+      - Apply Thai filters per tier
+      - Write daily tabs + upsert Compile
     """
     cfg = load_config()
     sc = SheetsClient(
@@ -178,33 +152,44 @@ def run_mock_hot_only() -> Dict[str, TierWriteResult]:
         output_prefix=cfg.output_prefix,
     )
 
-    # Load "Hot Lead" for both sources (mock mode by default)
-    pc = load_candidates_for_window(
-        SOURCE_PC, WINDOW_HOT, use_real_db=cfg.use_real_db, db_url=cfg.db_webview_pc or cfg.db_webview
-    )
-    mobile = load_candidates_for_window(
-        SOURCE_MOBILE, WINDOW_HOT, use_real_db=cfg.use_real_db, db_url=cfg.db_webview_mobile or cfg.db_webview
-    )
-    all_rows = pd.concat([pc, mobile], ignore_index=True)
+    # ---- Load per-window, per-source (mock) ----
+    hot_pc  = rules.tag_window(load_candidates_for_window(SOURCE_PC,     WINDOW_HOT, use_real_db=cfg.use_real_db, db_url=cfg.db_webview_pc or cfg.db_webview), WINDOW_HOT)
+    hot_mob = rules.tag_window(load_candidates_for_window(SOURCE_MOBILE, WINDOW_HOT, use_real_db=cfg.use_real_db, db_url=cfg.db_webview_mobile or cfg.db_webview), WINDOW_HOT)
 
-    # Split by tier label (A-* = Tier A)
-    a_rows = all_rows[all_rows.get("tier", "").map(is_tier_a)].copy()
-    non_a_rows = all_rows[~all_rows.get("tier", "").map(is_tier_a)].copy()
+    cold_pc  = rules.tag_window(load_candidates_for_window(SOURCE_PC,     WINDOW_COLD, use_real_db=cfg.use_real_db, db_url=cfg.db_webview_pc or cfg.db_webview), WINDOW_COLD)
+    cold_mob = rules.tag_window(load_candidates_for_window(SOURCE_MOBILE, WINDOW_COLD, use_real_db=cfg.use_real_db, db_url=cfg.db_webview_mobile or cfg.db_webview), WINDOW_COLD)
 
-    # Read this month's Compile per tier (empty in dry‑run placeholder)
+    hib_pc  = rules.tag_window(load_candidates_for_window(SOURCE_PC,     WINDOW_HIBERNATED, use_real_db=cfg.use_real_db, db_url=cfg.db_webview_pc or cfg.db_webview), WINDOW_HIBERNATED)
+    hib_mob = rules.tag_window(load_candidates_for_window(SOURCE_MOBILE, WINDOW_HIBERNATED, use_real_db=cfg.use_real_db, db_url=cfg.db_webview_mobile or cfg.db_webview), WINDOW_HIBERNATED)
+
+    pools = {
+        WINDOW_HOT:        [hot_pc, hot_mob],
+        WINDOW_COLD:       [cold_pc, cold_mob],
+        WINDOW_HIBERNATED: [hib_pc, hib_mob],
+    }
+
+    # ---- Build Tier A (HOT only) & Non‑A (re‑query) ----
+    # TODO (soon): available_callers = count from Callers tab (available=TRUE)
+    # target_rows_non_a = available_callers * cfg.per_caller_target
+    target_rows_non_a = 120  # demo target until Callers reader is added
+
+    a_rows_raw = rules.build_tier_a_pool(pools)                       # HOT only
+    non_a_rows_raw, _dbg = rules.build_non_a_pool(pools, target_rows=target_rows_non_a)
+
+    # ---- Read this month's Compile (empty in dry‑run) ----
     info_a = sc.find_or_create_month_file("Tier A")
     compile_a = sc.read_tab_as_df(info_a.spreadsheet_id, "Compile")
 
     info_n = sc.find_or_create_month_file("Non A")
     compile_n = sc.read_tab_as_df(info_n.spreadsheet_id, "Compile")
 
-    # Central blacklist + redeemed (TODO wire when config sheet/DB is available)
+    # Central blacklist + redeemed (TODO: wire real sources later)
     blacklist_df = pd.DataFrame()
-    redeemed = []  # e.g., usernames from Grafana for today
+    redeemed = []
 
-    # ---- Apply Thai drop filters per tier on RAW rows ----
+    # ---- Apply Thai drop filters on RAW rows ----
     a_rows_f = filters.apply_filters(
-        a_rows,
+        a_rows_raw,
         compile_df=compile_a,
         blacklist_df=blacklist_df,
         redeemed_usernames_today=redeemed,
@@ -217,7 +202,7 @@ def run_mock_hot_only() -> Dict[str, TierWriteResult]:
         drop_redeemed_today=cfg.drop_redeemed_today,
     )
     non_a_rows_f = filters.apply_filters(
-        non_a_rows,
+        non_a_rows_raw,
         compile_df=compile_n,
         blacklist_df=blacklist_df,
         redeemed_usernames_today=redeemed,
@@ -230,16 +215,16 @@ def run_mock_hot_only() -> Dict[str, TierWriteResult]:
         drop_redeemed_today=cfg.drop_redeemed_today,
     )
 
-    # Build per-tier output DataFrames
+    # ---- Map to output schemas ----
     tier_a_df = _build_tier_a_df(a_rows_f, ark_gem_col=cfg.ark_gem_column)
-    non_a_df = _build_non_a_df(non_a_rows_f)
+    non_a_df  = _build_non_a_df(non_a_rows_f)
 
-    # Write both
+    # ---- Write to Sheets (still dry‑run if creds missing) ----
     results: Dict[str, TierWriteResult] = {}
     results["Tier A"] = _write_tier(sc, "Tier A", tier_a_df)
     results["Non A"] = _write_tier(sc, "Non A", non_a_df)
 
-    # Notify (safe: skips if webhook missing)
+    # ---- Notify (skips if webhook missing) ----
     a = results["Tier A"]
     notify_discord(
         cfg.webhook_a,
