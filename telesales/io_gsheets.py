@@ -6,11 +6,11 @@ Google Sheets / Drive helpers with a *forgiving* dry‑run mode.
   We log what we would have done and return placeholders.
 - When creds are present, we use gspread + Drive API to:
     * find or create a month file in the target Drive folder
-    * ensure tabs exist
+    * ensure tabs exist (and delete default 'Sheet1' if not requested)
     * write a DataFrame to a tab
     * upsert to Compile (remove today's rows, append fresh)
 
-Requirements (already in requirements.txt):
+Requirements (in requirements.txt):
   - gspread, gspread-dataframe
   - google-api-python-client, google-auth
   - pandas
@@ -21,20 +21,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable, Optional, Tuple
-import os
-import sys
 
 import pandas as pd
 
-# Third‑party Google libs
+# Third‑party Google libs (optional at import time)
 try:
     import gspread
     from gspread_dataframe import set_with_dataframe, get_as_dataframe
     from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
-except Exception as _e:
-    # We allow imports to fail in environments without these libs yet.
+except Exception:
     gspread = None
     set_with_dataframe = None
     get_as_dataframe = None
@@ -94,9 +91,9 @@ class SheetsClient:
             return
 
         if not output_folder_id:
+            # we can still read sheets but won’t create files
             self._dry_run_reason = "missing OUTPUT_DRIVE_FOLDER_ID"
             self._log_dry_run("no output folder id")
-            # Still keep gspread handy for read‑only tasks, but we won’t create files.
 
     # -------------------------- util / state ----------------------------------
 
@@ -148,7 +145,6 @@ class SheetsClient:
         if self.drive is None or self.gc is None or not self.output_folder_id:
             return None
         try:
-            # Create empty Spreadsheet via Drive
             file_metadata = {
                 "name": name,
                 "mimeType": "application/vnd.google-apps.spreadsheet",
@@ -191,24 +187,36 @@ class SheetsClient:
             file_id, url = created
             return SheetsInfo(file_id, url, title)
 
-        # Fallback (shouldn't happen often)
+        # Fallback (rare)
         self._log(f"Could not create/find spreadsheet: {title}; returning placeholder.")
         return SheetsInfo("UNKNOWN", "https://docs.google.com", title)
 
-    def ensure_tabs(self, spreadsheet_id: str, tab_names: Iterable[str]) -> None:
-        """
-        Ensure each tab exists. If missing, create with 1x1 grid.
-        """
-        if self.dry_run or spreadsheet_id in {"DRY-RUN", "UNKNOWN"}:
-            self._log_dry_run(f"ensure_tabs({spreadsheet_id}, {list(tab_names)})")
-            return
-
-        sh = self.gc.open_by_key(spreadsheet_id)  # type: ignore
+    def ensure_tabs(self, spreadsheet_id: str, required_tabs: list[str]):
+        sh = self.gc.open_by_key(spreadsheet_id)  # open spreadsheet
         existing = {ws.title for ws in sh.worksheets()}
-        for name in tab_names:
-            if name not in existing:
-                sh.add_worksheet(title=name, rows=1, cols=1)
-                self._log(f"Created tab '{name}' in {spreadsheet_id}")
+
+        # Create missing tabs
+        for tab in required_tabs:
+            if tab not in existing:
+                sh.add_worksheet(title=tab, rows="1000", cols="26")
+
+        # Re-order so "Compile" stays first if it exists
+        if "Compile" in required_tabs and "Compile" in existing:
+            try:
+                ws = sh.worksheet("Compile")
+                sh.reorder_worksheets([ws] + [w for w in sh.worksheets() if w != ws])
+            except Exception as e:
+                print(f"[sheets] reorder failed: {e}")
+
+        # Delete empty default tab "Sheet1" if still present
+        if "Sheet1" in existing and len(sh.worksheets()) > len(required_tabs):
+            try:
+                ws = sh.worksheet("Sheet1")
+                sh.del_worksheet(ws)
+                print(f"[sheets] Deleted empty Sheet1 in {spreadsheet_id}")
+            except Exception:
+                pass
+
 
     def write_df_to_tab(self, spreadsheet_id: str, tab_name: str, df: pd.DataFrame) -> None:
         """
@@ -227,15 +235,16 @@ class SheetsClient:
         sh = self.gc.open_by_key(spreadsheet_id)  # type: ignore
         try:
             ws = sh.worksheet(tab_name)
-        except gspread.WorksheetNotFound:  # type: ignore
+        except Exception:
             ws = sh.add_worksheet(title=tab_name, rows=1, cols=1)
-        # Clear and write
+
         ws.clear()
         set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
 
     def read_tab_as_df(self, spreadsheet_id: str, tab_name: str) -> pd.DataFrame:
         """
-        Read a tab as DataFrame. If missing, returns empty df.
+        Return the tab as a DataFrame.
+        If the tab exists but is empty (no header/rows), return an empty DataFrame.
         """
         if self.dry_run or spreadsheet_id in {"DRY-RUN", "UNKNOWN"}:
             self._log_dry_run(f"read_tab_as_df({tab_name}) -> empty df")
@@ -245,17 +254,34 @@ class SheetsClient:
             self._log("gspread-dataframe not available; cannot read. Returning empty df.")
             return pd.DataFrame()
 
-        sh = self.gc.open_by_key(spreadsheet_id)  # type: ignore
         try:
-            ws = sh.worksheet(tab_name)
-        except gspread.WorksheetNotFound:  # type: ignore
-            return pd.DataFrame()
+            sh = self.gc.open_by_key(spreadsheet_id)  # type: ignore
+            try:
+                ws = sh.worksheet(tab_name)
+            except Exception:
+                return pd.DataFrame()
 
-        df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
-        # Drop completely empty rows
-        if df is not None and not df.empty:
-            df = df.dropna(how="all")
-        return df if df is not None else pd.DataFrame()
+            # Detect truly empty sheets (no values at all)
+            values = ws.get_all_values()
+            if not values or (len(values) == 1 and all(v == "" for v in values[0])):
+                return pd.DataFrame()
+
+            # Parse with first row as header
+            df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
+            if df is None:
+                return pd.DataFrame()
+
+            # If header row was blank, pandas may create Unnamed columns — treat as empty
+            col_names = [str(c) for c in df.columns]
+            if not col_names or all(c.startswith("Unnamed:") for c in col_names):
+                return pd.DataFrame()
+
+            # Drop trailing all‑NaN rows that sometimes appear
+            return df.dropna(how="all")
+
+        except Exception as e:
+            self._log(f"read_tab_as_df error on '{tab_name}': {e}")
+            return pd.DataFrame()
 
     def upsert_compile(self, spreadsheet_id: str, today_df: pd.DataFrame, assign_date_col: str = "Assign Date") -> None:
         """
@@ -272,18 +298,21 @@ class SheetsClient:
             return
 
         compile_df = self.read_tab_as_df(spreadsheet_id, "Compile")
-        # Normalize column if missing
+
+        # If Assign Date is missing, just append raw
         if assign_date_col not in today_df.columns:
-            # We don't try to guess here; just log.
             self._log("Assign Date column missing in today_df; writing raw append to Compile.")
             new_df = pd.concat([compile_df, today_df], ignore_index=True)
         else:
             today_val_set = set(str(v) for v in today_df[assign_date_col].astype(str).fillna(""))
+
             if compile_df is not None and not compile_df.empty and assign_date_col in compile_df.columns:
                 mask = ~compile_df[assign_date_col].astype(str).isin(today_val_set)
                 kept = compile_df[mask]
+                # Align columns (union) to avoid column mismatch
+                new_df = pd.concat([kept, today_df], ignore_index=True)
             else:
-                kept = pd.DataFrame(columns=today_df.columns)
-            new_df = pd.concat([kept, today_df], ignore_index=True)
+                # No existing Compile or no Assign Date column there — just use today's data
+                new_df = today_df.copy()
 
         self.write_df_to_tab(spreadsheet_id, "Compile", new_df)

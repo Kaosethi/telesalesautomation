@@ -1,27 +1,24 @@
 # telesales/assign.py
 """
-Mix‑aware assignment for Non‑A ONLY.
+Mix‑aware assignment for Non‑A ONLY (strict, even distribution).
 
-This module assigns Non‑A *raw rows* (before schema mapping) to available callers,
-using per‑source mix weights (e.g., 0.5 PC / 0.5 Mobile) and PER_CALLER_TARGET.
+What this guarantees:
+- Every available caller gets the SAME number of rows (no 17/16 skew).
+- Per‑caller mix is enforced via Hamilton apportionment (e.g., target=16 at 50/50 -> 8 PC, 8 Mobile),
+  with smart top‑ups only if a source bucket is short.
 
-IMPORTANT
-- Run this BEFORE building the Non‑A 13‑column output. It expects a 'source_key'
-  column on the input rows and will output a new 'telesale' column.
-- The pipeline’s _build_non_a_df can then read that 'telesale' column and place
-  it into the 'Telesale' output field.
+Leftovers (when total rows % callers != 0) are intentionally left unassigned,
+so counts remain perfectly equal, as requested.
 
-API
-- assign_mix_aware(non_a_rows, callers, per_caller_target, mix_weights)
+Inputs:
+  non_a_rows: DataFrame with at least ['username','phone','source_key', ...]
+  callers: list[str]
+  per_caller_target: int (upper bound before feasibility checks)
+  mix_weights: dict like {'cabal_pc_th': 0.5, 'cabal_mobile_th': 0.5}
 
-  non_a_rows: pandas.DataFrame with columns at least: ['username','phone','source_key', ...]
-  callers: list[str] of caller names (available=TRUE from Config sheet, later)
-  per_caller_target: int, e.g., 80
-  mix_weights: dict like {'cabal_pc_th': 0.5, 'cabal_mobile_th': 0.5}. Will be normalized.
-
-Returns: a copy of non_a_rows with a new column 'telesale' filled for the first
-         N = callers * per_caller_target rows (if enough data). It leaves extra
-         rows unassigned (you can drop or keep them depending on policy).
+Output:
+  Returns a COPY of non_a_rows with a new column 'telesale' filled on assigned rows.
+  Unassigned rows keep telesale="" so the pipeline can decide whether to drop them.
 """
 
 from __future__ import annotations
@@ -32,23 +29,53 @@ import pandas as pd
 
 from .constants import SOURCE_PC, SOURCE_MOBILE
 
+
 def _normalize_mix(mix: Dict[str, float]) -> Dict[str, float]:
-    """Ensure weights sum to 1.0; if empty or all zeros, default to 0.5/0.5 for PC/Mobile."""
-    # Remove negatives and None
-    cleaned = {k: float(v) for k, v in (mix or {}).items() if v is not None and float(v) > 0}
+    """Normalize positive weights to sum=1.0; default to 0.5/0.5 if empty."""
+    cleaned = {k: float(v) for k, v in (mix or {}).items()
+               if v is not None and float(v) > 0}
     total = sum(cleaned.values())
     if total <= 0:
         return {SOURCE_PC: 0.5, SOURCE_MOBILE: 0.5}
     return {k: v / total for k, v in cleaned.items()}
 
-def _take_first(df: pd.DataFrame, n: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Return (head_n, tail_rest) without modifying original index order."""
+
+def _hamilton_apportion(total: int, weights: Dict[str, float]) -> Dict[str, int]:
+    """
+    Hamilton (largest remainder) apportionment:
+    - base = floor(total * w_s) for each source s
+    - distribute remaining seats to largest remainders
+    """
+    if total <= 0:
+        return {k: 0 for k in weights.keys()}
+    base = {}
+    remainders = []
+    ssum = 0
+    for k, w in weights.items():
+        ideal = total * w
+        b = math.floor(ideal)
+        base[k] = b
+        ssum += b
+        remainders.append((k, ideal - b))
+    leftover = total - ssum
+    remainders.sort(key=lambda x: x[1], reverse=True)
+    i = 0
+    while leftover > 0 and i < len(remainders):
+        base[remainders[i][0]] += 1
+        leftover -= 1
+        i += 1
+    return base
+
+
+def _take_head(df: pd.DataFrame, n: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (head, tail) without altering original index values."""
     n = max(0, int(n))
-    if df is None or df.empty or n == 0:
+    if not isinstance(df, pd.DataFrame) or df.empty or n == 0:
         return (df.head(0).copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(), df.copy())
     head = df.head(n).copy()
     tail = df.iloc[len(head):].copy()
     return head, tail
+
 
 def assign_mix_aware(
     non_a_rows: pd.DataFrame,
@@ -56,105 +83,96 @@ def assign_mix_aware(
     per_caller_target: int,
     mix_weights: Dict[str, float],
 ) -> pd.DataFrame:
-    """
-    Assign Non‑A rows to callers using per‑source mix.
-
-    Steps:
-      1) Split the pool by source_key (e.g., PC vs Mobile).
-      2) For each caller, compute desired counts per source using mix weights.
-      3) Take that many rows from each source bucket (FIFO/stable).
-      4) Move to next caller (round‑robin).
-      5) If buckets run short, we take whatever remains proportionally.
-
-    Returns a COPY of non_a_rows with new column 'telesale' filled where assigned.
-    """
     if not isinstance(non_a_rows, pd.DataFrame) or non_a_rows.empty:
-        return pd.DataFrame(columns=list(non_a_rows.columns) + ["telesale"]) if isinstance(non_a_rows, pd.DataFrame) else pd.DataFrame()
+        return pd.DataFrame(columns=list(getattr(non_a_rows, "columns", [])) + ["telesale"])
 
-    callers = [c for c in callers if str(c).strip()]
-    if not callers or per_caller_target <= 0:
-        # Nothing to assign
+    callers = [c for c in (callers or []) if str(c).strip()]
+    if not callers:
         out = non_a_rows.copy()
         out["telesale"] = ""
         return out
 
+    # Buckets per source (stable order preserved via filtering)
     weights = _normalize_mix(mix_weights)
-
-    # Buckets per source (stable order retained)
-    by_src: Dict[str, pd.DataFrame] = {}
-    for src in weights.keys():
-        by_src[src] = non_a_rows[non_a_rows.get("source_key", "") == src].copy()
-
-    # Any rows from unknown sources are placed in a catch‑all and distributed last
+    by_src: Dict[str, pd.DataFrame] = {
+        s: non_a_rows[non_a_rows.get("source_key", "") == s].copy()
+        for s in weights.keys()
+    }
+    # Unknown sources go to a top‑up bucket
     unknown_df = non_a_rows[~non_a_rows.get("source_key", "").isin(weights.keys())].copy()
 
+    total_available = sum(len(df) for df in by_src.values()) + len(unknown_df)
+    k = len(callers)
+
+    # Make counts perfectly equal: cap target to floor(total / k)
+    target = min(max(0, int(per_caller_target)), total_available // k)
+
+    # If target is 0, nothing to assign (better equal than skewed)
+    if target <= 0:
+        out = non_a_rows.copy()
+        out["telesale"] = ""
+        return out
+
+    # For each caller, compute per‑source quotas using Hamilton apportionment.
+    # This enforces the per‑caller mix (e.g., target=16, 50/50 => 8+8).
     assigned_frames: List[pd.DataFrame] = []
-    remaining_by_src: Dict[str, pd.DataFrame] = {k: v.copy() for k, v in by_src.items()}
+    remaining: Dict[str, pd.DataFrame] = {k: v.copy() for k, v in by_src.items()}
 
     for caller in callers:
-        # Ideal counts for this caller by source (floor), and keep remainder for later pass
-        desired: Dict[str, int] = {}
-        remainder_tracker: List[Tuple[str, float]] = []
-        for src, w in weights.items():
-            ideal = per_caller_target * w
-            cnt = math.floor(ideal)
-            desired[src] = cnt
-            remainder_tracker.append((src, ideal - cnt))
+        quotas = _hamilton_apportion(target, weights)
 
-        # Distribute remaining slots (due to floors) by largest remainders first
-        remaining_slots = per_caller_target - sum(desired.values())
-        if remaining_slots > 0:
-            remainder_tracker.sort(key=lambda x: x[1], reverse=True)
-            for src, _rem in remainder_tracker:
-                if remaining_slots <= 0:
-                    break
-                desired[src] += 1
-                remaining_slots -= 1
-
-        # Pull rows from each source bucket
         taken_parts: List[pd.DataFrame] = []
-        for src, need in desired.items():
-            head, tail = _take_first(remaining_by_src.get(src, pd.DataFrame()), need)
+        # First pass: pull exactly the quota from each source (or as many as available)
+        got = 0
+        for src, need in quotas.items():
+            if need <= 0:
+                continue
+            head, tail = _take_head(remaining.get(src, pd.DataFrame()), need)
             if not head.empty:
-                head = head.copy()
                 head["telesale"] = caller
                 taken_parts.append(head)
-                remaining_by_src[src] = tail
+                got += len(head)
+                remaining[src] = tail
 
-        # If underfilled (buckets ran short), top up from unknown or any remaining across sources
-        got = sum(len(p) for p in taken_parts)
-        short = per_caller_target - got
+        # If underfilled due to source shortage, top‑up from other sources proportionally
+        short = target - got
         if short > 0:
-            # First, try unknown source bucket
-            if not unknown_df.empty:
-                add, unknown_df = _take_first(unknown_df, short)
+            # Try other known sources with remaining rows
+            # Prefer sources with most remaining rows to minimize skew.
+            sources_by_left = sorted(
+                [(s, len(df)) for s, df in remaining.items() if len(df) > 0],
+                key=lambda x: x[1],
+                reverse=True,
+            )
+            for src, _left in sources_by_left:
+                if short <= 0:
+                    break
+                add, tail2 = _take_head(remaining[src], short)
                 if not add.empty:
                     add["telesale"] = caller
                     taken_parts.append(add)
-                    got += len(add)
-                    short = per_caller_target - got
+                    short -= len(add)
+                    remaining[src] = tail2
 
-            # Then, pull extra from any sources that still have rows
-            if short > 0:
-                for src in weights.keys():
-                    if short <= 0:
-                        break
-                    add, tail2 = _take_first(remaining_by_src.get(src, pd.DataFrame()), short)
-                    if not add.empty:
-                        add["telesale"] = caller
-                        taken_parts.append(add)
-                        short -= len(add)
-                        remaining_by_src[src] = tail2
+        # Still short? Pull from unknown bucket, if any.
+        if short > 0 and not unknown_df.empty:
+            add, unknown_df = _take_head(unknown_df, short)
+            if not add.empty:
+                add["telesale"] = caller
+                taken_parts.append(add)
+                short -= len(add)
 
+        # At this point, caller either has exactly `target` rows, or less if global capacity isn’t enough.
+        # But because we capped `target` to floor(total/k), we should hit exact targets for all callers.
         if taken_parts:
-            assigned_frames.append(pd.concat(taken_parts, ignore_index=True))
+            assigned_frames.append(pd.concat(taken_parts, ignore_index=False))
 
-    # Any leftovers remain unassigned (telesale empty)
-    assigned_df = pd.concat(assigned_frames, ignore_index=True) if assigned_frames else pd.DataFrame()
+    # Build output: fill telesale for assigned indices; leave others empty
     out = non_a_rows.copy()
     out["telesale"] = ""
-    if not assigned_df.empty:
-        # Align columns, then fill telesale where we assigned (by index alignment)
-        out.loc[assigned_df.index, "telesale"] = assigned_df["telesale"].values
+    if assigned_frames:
+        assigned = pd.concat(assigned_frames, ignore_index=False)
+        # Align back to original indices
+        out.loc[assigned.index, "telesale"] = assigned["telesale"].values
 
     return out
