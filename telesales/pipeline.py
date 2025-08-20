@@ -16,6 +16,7 @@ from .constants import (
     COL_INACTIVE_DAYS, COL_REWARD_RANK, COL_TELESALE,
     COL_AMOUNT, COL_ARK_GEM, COL_REWARD,
     WINDOW_HOT, WINDOW_COLD, WINDOW_HIBERNATED,
+    COL_SOURCE,                 # ← import the correct header key ("Source")
     is_tier_a,
 )
 from .utils import today_key, normalize_phone, split_calling_code_th, inactive_days
@@ -64,92 +65,6 @@ def _finalize_to_headers(data: Dict[str, List], headers: List[str]) -> pd.DataFr
     return df[headers]
 
 
-# ----------------------------- build dataframes -------------------------------
-
-def _build_tier_a_df(source_rows: pd.DataFrame, ark_gem_col: str) -> pd.DataFrame:
-    if source_rows is None or source_rows.empty:
-        return pd.DataFrame(columns=TIER_A_HEADERS)
-
-    phones = source_rows["phone"].map(normalize_phone)
-    inact = source_rows.apply(
-        lambda r: inactive_days(
-            r.get("last_login") if isinstance(r.get("last_login"), datetime) else None,
-            r.get("last_seen") if isinstance(r.get("last_seen"), datetime) else None,
-        ),
-        axis=1,
-    )
-
-    data = {
-        "No.": list(range(1, len(source_rows) + 1)),
-        COL_USERNAME: source_rows["username"].astype(str).tolist(),
-        COL_PHONE: phones.tolist(),
-        COL_TIER: source_rows.get("tier", "").tolist() if "tier" in source_rows.columns else [""] * len(source_rows),
-        COL_INACTIVE_DAYS: inact.tolist(),
-        COL_AMOUNT: [""] * len(source_rows),
-        COL_ARK_GEM: source_rows.get(ark_gem_col, "").tolist() if ark_gem_col in source_rows.columns else [""] * len(source_rows),
-        COL_REWARD: source_rows.get("reward_tier", "").tolist() if "reward_tier" in source_rows.columns else [""] * len(source_rows),
-        COL_ASSIGN_DATE: [today_key()] * len(source_rows),
-    }
-    if "Platform" in TIER_A_HEADERS:
-        data["Platform"] = source_rows.get("source_key", "").tolist() if "source_key" in source_rows.columns else [""] * len(source_rows)
-
-    return _finalize_to_headers(data, TIER_A_HEADERS)
-
-
-def _build_non_a_df(source_rows: pd.DataFrame) -> pd.DataFrame:
-    if source_rows is None or source_rows.empty:
-        return pd.DataFrame(columns=NON_A_HEADERS)
-
-    local_digits = source_rows["phone"].map(normalize_phone)
-    cc, local = zip(*[split_calling_code_th(p) for p in local_digits])
-
-    inact = source_rows.apply(
-        lambda r: inactive_days(
-            r.get("last_login") if isinstance(r.get("last_login"), datetime) else None,
-            r.get("last_seen") if isinstance(r.get("last_seen"), datetime) else None,
-        ),
-        axis=1,
-    )
-
-    data = {
-        "No.": list(range(1, len(source_rows) + 1)),
-        COL_USERNAME_OUT: source_rows["username"].astype(str).tolist(),
-        COL_CALLING_CODE: list(cc),
-        COL_PHONE: list(local),
-        COL_TIER: source_rows.get("tier", "").tolist() if "tier" in source_rows.columns else [""] * len(source_rows),
-        COL_INACTIVE_DAYS: inact.tolist(),
-        COL_REWARD_RANK: source_rows.get("reward_tier", "").tolist() if "reward_tier" in source_rows.columns else [""] * len(source_rows),
-        COL_TELESALE: source_rows.get("telesale", "").tolist() if "telesale" in source_rows.columns else [""] * len(source_rows),
-        COL_ASSIGN_DATE: [today_key()] * len(source_rows),
-        "Recall Date/Time": [""] * len(source_rows),
-        "Call Status": [""] * len(source_rows),
-        "Answer Status": [""] * len(source_rows),
-        "Result": [""] * len(source_rows),
-    }
-    if "Platform" in NON_A_HEADERS:
-        data["Platform"] = source_rows.get("source_key", "").tolist() if "source_key" in source_rows.columns else [""] * len(source_rows)
-
-    return _finalize_to_headers(data, NON_A_HEADERS)
-
-
-# ----------------------------- core write ops ---------------------------------
-
-def _write_tier(sc: SheetsClient, tier_label: str, df: pd.DataFrame) -> TierWriteResult:
-    info: SheetsInfo = sc.find_or_create_month_file(tier_label)
-    day_tab = today_key()
-    sc.ensure_tabs(info.spreadsheet_id, ["Compile", day_tab])  # Compile first in list
-    sc.write_df_to_tab(info.spreadsheet_id, day_tab, df)
-    sc.upsert_compile(info.spreadsheet_id, df, assign_date_col=COL_ASSIGN_DATE)
-    return TierWriteResult(
-        tier=tier_label,
-        file_name=info.title,
-        tab_name=day_tab,
-        row_count=len(df),
-        sheet_url=info.spreadsheet_url,
-        spreadsheet_id=info.spreadsheet_id,
-    )
-
-
 def _read_available_callers(sc: SheetsClient, config_sheet_id: str | None) -> List[str]:
     if not config_sheet_id:
         return []
@@ -188,6 +103,131 @@ def _read_available_callers(sc: SheetsClient, config_sheet_id: str | None) -> Li
     return callers
 
 
+def _read_mix_weights(sc: SheetsClient, config_sheet_id: str | None) -> dict[str, float]:
+    """Read {source_key -> mix_weight} from Config tab where enabled==TRUE, normalize to sum=1.0."""
+    if not config_sheet_id:
+        return {}
+    df = sc.read_tab_as_df(config_sheet_id, "Config")
+    if df is None or df.empty:
+        return {}
+
+    cols = {str(c).strip().lower(): c for c in df.columns if isinstance(c, str)}
+    sk_col = cols.get("source_key") or cols.get("source") or list(cols.values())[0]
+    en_col = cols.get("enabled") or "enabled"
+    mw_col = cols.get("mix_weight") or "mix_weight"
+
+    # parse enabled flag
+    def _b(v): return str(v).strip().lower() in {"1", "true", "yes", "y"}
+
+    if en_col in df.columns:
+        df = df[df[en_col].map(_b)]
+
+    if sk_col not in df.columns or mw_col not in df.columns:
+        return {}
+
+    # coerce mix_weight to numeric and drop non-positive
+    ww = pd.to_numeric(df[mw_col], errors="coerce")
+    df = df.assign(**{mw_col: ww}).dropna(subset=[mw_col])
+    df = df[df[mw_col] > 0]
+
+    weights = {str(r[sk_col]).strip(): float(r[mw_col]) for _, r in df[[sk_col, mw_col]].iterrows()}
+    s = sum(weights.values())
+    return {k: v / s for k, v in weights.items()} if s > 0 else {}
+
+
+# ----------------------------- build dataframes -------------------------------
+
+def _build_tier_a_df(source_rows: pd.DataFrame, ark_gem_col: str) -> pd.DataFrame:
+    if source_rows is None or source_rows.empty:
+        return pd.DataFrame(columns=TIER_A_HEADERS)
+
+    phones = source_rows["phone"].map(normalize_phone)
+    inact = source_rows.apply(
+        lambda r: inactive_days(
+            r.get("last_login") if isinstance(r.get("last_login"), datetime) else None,
+            r.get("last_seen") if isinstance(r.get("last_seen"), datetime) else None,
+        ),
+        axis=1,
+    )
+
+    data = {
+        "No.": list(range(1, len(source_rows) + 1)),
+        COL_USERNAME: source_rows["username"].astype(str).tolist(),
+        COL_PHONE: phones.tolist(),
+        COL_TIER: source_rows.get("tier", "").tolist() if "tier" in source_rows.columns else [""] * len(source_rows),
+        COL_INACTIVE_DAYS: inact.tolist(),
+        COL_AMOUNT: [""] * len(source_rows),
+        COL_ARK_GEM: source_rows.get(ark_gem_col, "").tolist() if ark_gem_col in source_rows.columns else [""] * len(source_rows),
+        COL_REWARD: source_rows.get("reward_tier", "").tolist() if "reward_tier" in source_rows.columns else [""] * len(source_rows),
+        COL_ASSIGN_DATE: [today_key()] * len(source_rows),
+    }
+    # Write Source column if present in headers (map from 'source_key')
+    if COL_SOURCE in TIER_A_HEADERS:
+        data[COL_SOURCE] = (
+            source_rows["source_key"].astype(str).tolist()
+            if "source_key" in source_rows.columns else [""] * len(source_rows)
+        )
+
+    return _finalize_to_headers(data, TIER_A_HEADERS)
+
+
+def _build_non_a_df(source_rows: pd.DataFrame) -> pd.DataFrame:
+    if source_rows is None or source_rows.empty:
+        return pd.DataFrame(columns=NON_A_HEADERS)
+
+    local_digits = source_rows["phone"].map(normalize_phone)
+    cc, local = zip(*[split_calling_code_th(p) for p in local_digits])
+
+    inact = source_rows.apply(
+        lambda r: inactive_days(
+            r.get("last_login") if isinstance(r.get("last_login"), datetime) else None,
+            r.get("last_seen") if isinstance(r.get("last_seen"), datetime) else None,
+        ),
+        axis=1,
+    )
+
+    data = {
+        "No.": list(range(1, len(source_rows) + 1)),
+        COL_USERNAME_OUT: source_rows["username"].astype(str).tolist(),
+        COL_CALLING_CODE: list(cc),
+        COL_PHONE: list(local),
+        COL_TIER: source_rows.get("tier", "").tolist() if "tier" in source_rows.columns else [""] * len(source_rows),
+        COL_INACTIVE_DAYS: inact.tolist(),
+        COL_REWARD_RANK: source_rows.get("reward_tier", "").tolist() if "reward_tier" in source_rows.columns else [""] * len(source_rows),
+        COL_TELESALE: source_rows.get("telesale", "").tolist() if "telesale" in source_rows.columns else [""] * len(source_rows),
+        COL_ASSIGN_DATE: [today_key()] * len(source_rows),
+        "Recall Date/Time": [""] * len(source_rows),
+        "Call Status": [""] * len(source_rows),
+        "Answer Status": [""] * len(source_rows),
+        "Result": [""] * len(source_rows),
+    }
+    # Write Source column if present in headers (map from 'source_key')
+    if COL_SOURCE in NON_A_HEADERS:
+        data[COL_SOURCE] = (
+            source_rows["source_key"].astype(str).tolist()
+            if "source_key" in source_rows.columns else [""] * len(source_rows)
+        )
+
+    return _finalize_to_headers(data, NON_A_HEADERS)
+
+
+# ----------------------------- core write ops ---------------------------------
+
+def _write_tier(sc: SheetsClient, tier_label: str, df: pd.DataFrame) -> TierWriteResult:
+    info: SheetsInfo = sc.find_or_create_month_file(tier_label)
+    day_tab = today_key()
+    sc.ensure_tabs(info.spreadsheet_id, ["Compile", day_tab])  # Compile first in list
+    sc.write_df_to_tab(info.spreadsheet_id, day_tab, df)
+    sc.upsert_compile(info.spreadsheet_id, df, assign_date_col=COL_ASSIGN_DATE)
+    return TierWriteResult(
+        tier=tier_label,
+        file_name=info.title,
+        tab_name=day_tab,
+        row_count=len(df),
+        sheet_url=info.spreadsheet_url,
+        spreadsheet_id=info.spreadsheet_id,
+    )
+
 
 # ----------------------------- public run -------------------------------------
 
@@ -218,7 +258,7 @@ def run_mock_hot_only() -> Dict[str, TierWriteResult]:
     if not a_rows_raw.empty:
         a_rows_raw = a_rows_raw[a_rows_raw.get("tier", "").map(is_tier_a)]
 
-    # Non‑A = re‑query then keep only non‑A
+    # Non-A = re-query then keep only non-A
     callers = _read_available_callers(sc, cfg.config_sheet_id)
     per_caller = max(1, int(cfg.per_caller_target))
     target_rows_non_a = (len(callers) * per_caller) if callers else 100000
@@ -259,9 +299,9 @@ def run_mock_hot_only() -> Dict[str, TierWriteResult]:
         drop_redeemed_today=cfg.drop_redeemed_today,
     )
 
-    # Assignment (Non‑A only)
+    # Assignment (Non-A only) using dynamic mix weights from Config
     if callers and not non_a_rows_f.empty:
-        mix = {"cabal_pc_th": 0.5, "cabal_mobile_th": 0.5}  # TODO: read from Config tab later
+        mix = _read_mix_weights(sc, cfg.config_sheet_id) or {"cabal_pc_th": 0.5, "cabal_mobile_th": 0.5}
         non_a_rows_f = assign_mix_aware(
             non_a_rows_f,
             callers=callers,
