@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Iterable, Optional, Set, Tuple
 import pandas as pd
+from .utils import today_key
 
 
 # ---- Thai status sets (as given) ---------------------------------------------
@@ -88,7 +89,11 @@ def apply_filters(
     if not bl.empty:
         bl_key = _triple_key(bl).unique()
         pool_key = _triple_key(df)
+        before = keep.sum()
         keep &= ~pool_key.isin(bl_key)
+        dropped_blacklist = int(before - keep.sum())
+    else:
+        dropped_blacklist = 0
 
     # --- Compile-based rules (this month) -------------------------------------
     if not comp.empty:
@@ -107,6 +112,25 @@ def apply_filters(
             "ans": comp_ans,
             "res": comp_res,
         })
+
+        # Today idempotency: drop candidates already assigned today
+        comp_assign = _safe_str_series(comp.get("Assign Date", pd.Series()))
+        today_str = today_key()
+        if "Assign Date" in comp.columns:
+            comp_today = pd.DataFrame({
+                "username": comp_user,
+                "phone": comp_phone,
+                "platform": comp_platform,
+                "assign": comp_assign,
+            })
+            today_keys = set(
+                comp_today.loc[comp_today["assign"].astype(str) == today_str, ["username","phone","platform"]]
+                .dropna(how="all")
+                .apply(lambda r: f"{r['phone']}|{r['username']}|{r['platform']}", axis=1)
+                .tolist()
+            )
+        else:
+            today_keys = set()
 
         # Unreachable count ≥ N (this month)
         if drop_unreachable_repeat:
@@ -145,6 +169,14 @@ def apply_filters(
         # Build pool keys to match against Compile-derived sets
         pool_key = _triple_key(df)
 
+        # Today duplicates
+        if today_keys:
+            before = keep.sum()
+            keep &= ~pool_key.isin(today_keys)
+            dropped_idempotent = int(before - keep.sum())
+        else:
+            dropped_idempotent = 0
+
         # Apply unreachable≥N
         if drop_unreachable_repeat and not unreachable_counts.empty:
             # join counts onto df by (username, phone, platform)
@@ -152,18 +184,39 @@ def apply_filters(
             # explode unreachable_counts into a df for merge
             uc_df = unreachable_counts.reset_index().assign(
                 _key=lambda t: t["phone"].astype(str) + "|" + t["username"].astype(str) + "|" + t["platform"].astype(str)
-            )[["_key", "unreach_cnt"]]
+            )[['_key', 'unreach_cnt']]
             df3 = df3.merge(uc_df, on="_key", how="left")
             df3["unreach_cnt"] = df3["unreach_cnt"].fillna(0).astype(int)
+            before = keep.sum()
             keep &= df3["unreach_cnt"] < int(unreachable_min_count)
+            dropped_unreachable = int(before - keep.sum())
+            print(f"[filters] dropped_unreachable={dropped_unreachable}")
+        else:
+            dropped_unreachable = 0
 
         # Answered this month
         if drop_answered_this_month and answered_keys:
+            before = keep.sum()
             keep &= ~pool_key.isin(answered_keys)
+            dropped_answered = int(before - keep.sum())
+            print(f"[filters] dropped_answered={dropped_answered}")
+        else:
+            dropped_answered = 0
 
         # Not interested this month
         if drop_not_interested_this_month and not_interested_keys:
+            before = keep.sum()
             keep &= ~pool_key.isin(not_interested_keys)
+            dropped_not_interested = int(before - keep.sum())
+        else:
+            dropped_not_interested = 0
+
+        # Debug print once with counters and date hints for idempotency
+        try:
+            uniq_assign = sorted(set(comp_assign.dropna().astype(str).unique().tolist()))[:5]
+            print(f"[filters] today={today_str} sample_assign={uniq_assign} drops idempotent={dropped_idempotent} unreachable={dropped_unreachable} answered={dropped_answered} not_interested={dropped_not_interested} blacklist={dropped_blacklist}")
+        except Exception:
+            pass
 
     # --- Lifetime rules from past results (ever) -------------------------------
     # These require looking at lifetime outcomes. Since we only have current-month Compile right now,
