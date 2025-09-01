@@ -32,26 +32,27 @@ def run() -> TierWriteResult:
     cfg = load_config()
     sc = SheetsClient(service_account_file=cfg.service_account_file, output_folder_id=cfg.output_folder_id, output_prefix=cfg.output_prefix)
 
-    # Holidays gate (RUN_DATE-aware)
+    # Holidays/weekend gate (RUN_DATE-aware)
     run_date_env = os.getenv("RUN_DATE")
     holidays_df = sc.read_tab_as_df(cfg.config_sheet_id, "Holidays") if cfg.config_sheet_id else pd.DataFrame()
-    if holidays_df is not None and not holidays_df.empty:
-        cols = {str(c).strip().lower(): c for c in holidays_df.columns if isinstance(c, str)}
-        dcol = cols.get("date") or list(cols.values())[0]
-        hcol = cols.get("holiday") or "holiday"
-        try:
-            import pandas as _pd
-            target_day = _pd.to_datetime(run_date_env).date() if run_date_env else _pd.Timestamp.today().date()
+    try:
+        import pandas as _pd
+        target_day = _pd.to_datetime(run_date_env).date() if run_date_env else _pd.Timestamp.today().date()
+        # Weekend skip (Sat=5, Sun=6)
+        if target_day.weekday() >= 5:
+            print(f"[Tier A] weekend {target_day} — skipping")
+            return TierWriteResult("Tier A", "", today_key(), 0, "", "")
+        # Holidays sheet: presence of date implies holiday (no boolean needed)
+        if holidays_df is not None and not holidays_df.empty:
+            cols = {str(c).strip().lower(): c for c in holidays_df.columns if isinstance(c, str)}
+            dcol = cols.get("date") or list(cols.values())[0]
             hd = holidays_df.copy()
-            hd["_date"] = _pd.to_datetime(hd[dcol], errors="coerce").dt.date
-            mask = hd["_date"] == target_day
-            if hcol in hd.columns and mask.any():
-                val = str(hd.loc[mask, hcol].iloc[0]).strip().lower()
-                if val in {"1","true","t","yes","y"}:
-                    print("[Tier A] holiday today — skipping")
-                    return TierWriteResult("Tier A", "", today_key(), 0, "", "")
-        except Exception:
-            pass
+            hd["_date"] = _pd.to_datetime(hd[dcol], errors="coerce", dayfirst=True).dt.date
+            if (hd["_date"] == target_day).any():
+                print("[Tier A] holiday today — skipping")
+                return TierWriteResult("Tier A", "", today_key(), 0, "", "")
+    except Exception:
+        pass
 
     # Windows overrides before pool loading
     win_df = sc.read_tab_as_df(cfg.config_sheet_id, "Windows") if cfg.config_sheet_id else pd.DataFrame()
