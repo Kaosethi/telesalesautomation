@@ -70,7 +70,7 @@ class Config:
     # Drop toggles
     drop_unreachable_repeat: bool = True
     unreachable_min_count: int = 2
-    drop_answered_this_month: bool = True
+    drop_answered_this_month: bool = False
     drop_invalid_number: bool = True
     drop_not_interested_this_month: bool = True
     drop_not_owner_as_blacklist: bool = True

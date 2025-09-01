@@ -1,3 +1,5 @@
+ 
+
 # telesales/loaders.py
 """
 Data loaders for candidate pools.
@@ -17,7 +19,7 @@ Windows:
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 from datetime import datetime, timedelta
 import os
 import random
@@ -32,6 +34,23 @@ from .constants import (
 
 # ----------------------------- helpers ----------------------------------------
 
+_WINDOW_OVERRIDES: Dict[str, Tuple[int, Optional[int]]] = {}
+
+def _canon_window(label: str) -> str:
+    s = str(label or "").strip()
+    if s.lower() == "cold lead":
+        return WINDOW_COLD
+    return s
+
+def set_window_overrides(overrides: Dict[str, Tuple[int, Optional[int]]]) -> None:
+    """
+    Set per-window inactivity ranges from sheet.
+    overrides: {label -> (day_min, day_max or None)}; blank max means open-ended.
+    Labels are canonicalized (e.g., "Cold Lead" -> "Cold").
+    """
+    global _WINDOW_OVERRIDES
+    _WINDOW_OVERRIDES = { _canon_window(k): (int(v[0]), (None if v[1] is None else int(v[1]))) for k, v in (overrides or {}).items() }
+
 def _today() -> datetime:
     # Keep tz-naive here; we compute inactivity days elsewhere using app tz if needed
     return datetime.now()
@@ -42,9 +61,14 @@ def _inactive_range_for_window(window_label: str) -> Tuple[int, int]:
     Return (min_days, max_days_inclusive) for a given window label.
     For Hibernated we clamp to a wide range (15–40) to keep mock data reasonable.
     """
-    if window_label == WINDOW_HOT:
+    label = _canon_window(window_label)
+    if label in _WINDOW_OVERRIDES:
+        dmin, dmax = _WINDOW_OVERRIDES[label]
+        # Open-ended max: cap to 60 days for mock generator while still reflecting sheet intent
+        return (max(0, int(dmin)),  int(60 if dmax is None else dmax))
+    if label == WINDOW_HOT:
         return (3, 7)
-    if window_label == WINDOW_COLD:
+    if label == WINDOW_COLD:
         return (8, 14)
     # Hibernated: 15+
     return (15, 40)

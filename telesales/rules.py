@@ -140,6 +140,136 @@ def build_non_a_pool(
 
 
 # --------------------------------------------------------------------------- #
+# Source-first re-query (Non-A)
+# --------------------------------------------------------------------------- #
+
+def _normalize_mix_local(weights: Dict[str, float]) -> Dict[str, float]:
+    cleaned = {str(k): float(v) for k, v in (weights or {}).items() if v is not None and float(v) > 0}
+    s = sum(cleaned.values())
+    if s <= 0:
+        return cleaned
+    return {k: v / s for k, v in cleaned.items()}
+
+def _hamilton_apportion_local(total: int, weights: Dict[str, float]) -> Dict[str, int]:
+    if total <= 0 or not weights:
+        return {k: 0 for k in weights.keys()}
+    base: Dict[str, int] = {}
+    rem: List[Tuple[str, float]] = []
+    ssum = 0
+    for k, w in weights.items():
+        ideal = total * w
+        b = int(ideal // 1)
+        base[k] = b
+        ssum += b
+        rem.append((k, ideal - b))
+    leftover = total - ssum
+    rem.sort(key=lambda x: x[1], reverse=True)
+    i = 0
+    while leftover > 0 and i < len(rem):
+        base[rem[i][0]] += 1
+        leftover -= 1
+        i += 1
+    return base
+
+def _filter_by_source(df: pd.DataFrame, source_key: str) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    return df[df.get("source_key", "") == source_key]
+
+def requery_non_a_source_first(
+    pools_by_window: Dict[str, List[pd.DataFrame]],
+    mix_weights: Dict[str, float],
+    target_rows: int,
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """
+    Source-first selection:
+      1) Compute per-source quotas from normalized weights so sum == target_rows.
+      2) For each source independently: pull Hot -> Cold -> Hibernated up to its quota.
+      3) Dedupe by phone (earlier window wins) within and across sources.
+      4) If total < target_rows, borrow from remaining other-source pools in window order.
+    Returns (final_df, debug_counts_by_window) where counts reflect the last deduped tally per window.
+    """
+    weights = _normalize_mix_local(mix_weights or {})
+    quotas = _hamilton_apportion_local(int(target_rows), weights)
+
+    # Prepare per-window lists
+    pools: Dict[str, List[pd.DataFrame]] = {w: [df for df in pools_by_window.get(w, []) if isinstance(df, pd.DataFrame)] for w in WINDOW_PRIORITY}
+
+    # Remaining frames per source per window (mutable copies)
+    remaining: Dict[str, Dict[str, pd.DataFrame]] = {}
+    sources = list(weights.keys())
+    for s in sources:
+        remaining[s] = {}
+        for w in WINDOW_PRIORITY:
+            # concat frames for that window then filter by source
+            pool_w = pd.concat(pools.get(w, []), ignore_index=True) if pools.get(w) else pd.DataFrame()
+            remaining[s][w] = _filter_by_source(pool_w, s)
+
+    taken_frames: List[pd.DataFrame] = []
+
+    # Helper to drop phones from remaining once taken
+    def _drop_taken_from_remaining(phones: pd.Series) -> None:
+        ph_set = set(phones.astype(str).tolist())
+        for s in sources:
+            for w in WINDOW_PRIORITY:
+                dfw = remaining[s][w]
+                if isinstance(dfw, pd.DataFrame) and not dfw.empty:
+                    remaining[s][w] = dfw[~dfw["phone"].astype(str).isin(ph_set)]
+
+    # Step 1-2: fill per source in window order
+    for s in sources:
+        need = int(quotas.get(s, 0))
+        if need <= 0:
+            continue
+        parts: List[pd.DataFrame] = []
+        got = 0
+        for w in WINDOW_PRIORITY:
+            if got >= need:
+                break
+            dfw = remaining[s][w]
+            if dfw is None or dfw.empty:
+                continue
+            # Merge current parts with new window, dedupe, then take head up to need
+            merged = pd.concat(parts + [dfw], ignore_index=True)
+            deduped = earlier_window_wins_dedupe(merged)
+            take_n = min(need, len(deduped))
+            chosen = deduped.head(take_n)
+            parts = [chosen]
+            got = len(chosen)
+        if parts:
+            chosen = parts[0]
+            taken_frames.append(chosen)
+            _drop_taken_from_remaining(chosen["phone"])
+
+    # Step 3-4: Borrow if short
+    combined = pd.concat(taken_frames, ignore_index=True) if taken_frames else pd.DataFrame()
+    combined = earlier_window_wins_dedupe(combined) if not combined.empty else combined
+    if len(combined) < int(target_rows):
+        # Build a borrowing pool from all remaining sources in window order
+        borrow_frames: List[pd.DataFrame] = []
+        for w in WINDOW_PRIORITY:
+            for s in sources:
+                dfw = remaining[s][w]
+                if isinstance(dfw, pd.DataFrame) and not dfw.empty:
+                    borrow_frames.append(dfw)
+        if borrow_frames:
+            bor = pd.concat([combined] + borrow_frames, ignore_index=True)
+            bor = earlier_window_wins_dedupe(bor)
+            combined = bor.head(int(target_rows))
+
+    # Debug counts by window after final dedupe
+    counts: Dict[str, int] = {}
+    if isinstance(combined, pd.DataFrame) and not combined.empty:
+        for w in WINDOW_PRIORITY:
+            counts[w] = int((combined.get("window_label", "") == w).sum())
+    else:
+        for w in WINDOW_PRIORITY:
+            counts[w] = 0
+
+    return combined.reset_index(drop=True), counts
+
+
+# --------------------------------------------------------------------------- #
 # Tier A pool (Hot only, no re‑query)
 # --------------------------------------------------------------------------- #
 
