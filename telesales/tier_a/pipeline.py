@@ -20,6 +20,7 @@ class TierWriteResult:
     sheet_url: str
     spreadsheet_id: str
 
+
 def _write(sc: SheetsClient, label: str, df: pd.DataFrame) -> TierWriteResult:
     info: SheetsInfo = sc.find_or_create_month_file(label)
     day_tab = today_key()
@@ -27,6 +28,7 @@ def _write(sc: SheetsClient, label: str, df: pd.DataFrame) -> TierWriteResult:
     sc.write_df_to_tab(info.spreadsheet_id, day_tab, df)
     sc.upsert_compile(info.spreadsheet_id, df, assign_date_col=COL_ASSIGN_DATE)
     return TierWriteResult(label, info.title, day_tab, len(df), info.spreadsheet_url, info.spreadsheet_id)
+
 
 def run() -> TierWriteResult:
     cfg = load_config()
@@ -41,25 +43,21 @@ def run() -> TierWriteResult:
     holidays_df = sc.read_tab_as_df(cfg.config_sheet_id, "Holidays") if cfg.config_sheet_id else pd.DataFrame()
     try:
         import pandas as _pd
-        target_day = _pd.to_datetime(
-            run_date_env, format="%Y-%m-%d", errors="coerce"
-        ).date() if run_date_env else _pd.Timestamp.today().date()
+        target_day = (
+            _pd.to_datetime(run_date_env, format="%Y-%m-%d", errors="coerce").date()
+            if run_date_env else _pd.Timestamp.today().date()
+        )
 
-        # Weekend skip (Sat=5, Sun=6)
         if target_day.weekday() >= 5:
             print(f"[Tier A] weekend {target_day} — skipping")
             return TierWriteResult("Tier A", "", today_key(), 0, "", "")
 
-        # Holidays sheet: presence of date implies holiday
         if holidays_df is not None and not holidays_df.empty:
-            cols = {str(c).strip().lower(): c for c in holidays_df.columns if isinstance(c, str)}
-            dcol = cols.get("date") or list(cols.values())[0]
+            holidays_df.columns = [str(c).strip().lower() for c in holidays_df.columns]
+            dcol = "date" if "date" in holidays_df.columns else holidays_df.columns[0]
             hd = holidays_df.copy()
-            hd["_date"] = _pd.to_datetime(
-                hd[dcol], format="%Y-%m-%d", errors="coerce"
-            ).dt.date
-            holidays_set = set(hd["_date"].dropna())
-            if target_day in holidays_set:
+            hd["_date"] = _pd.to_datetime(hd[dcol], format="%Y-%m-%d", errors="coerce").dt.date
+            if target_day in set(hd["_date"].dropna()):
                 print(f"[Tier A] holiday {target_day} — skipping")
                 return TierWriteResult("Tier A", "", today_key(), 0, "", "")
     except Exception as e:
@@ -68,10 +66,10 @@ def run() -> TierWriteResult:
     # Windows overrides before pool loading
     win_df = sc.read_tab_as_df(cfg.config_sheet_id, "Windows") if cfg.config_sheet_id else pd.DataFrame()
     if win_df is not None and not win_df.empty:
-        cols = {str(c).strip().lower(): c for c in win_df.columns if isinstance(c, str)}
-        lcol = cols.get("label") or list(cols.values())[0]
-        minc = cols.get("day_min") or "day_min"
-        maxc = cols.get("day_max") or "day_max"
+        win_df.columns = [str(c).strip().lower() for c in win_df.columns]
+        lcol = "label" if "label" in win_df.columns else win_df.columns[0]
+        minc = "day_min" if "day_min" in win_df.columns else "day_min"
+        maxc = "day_max" if "day_max" in win_df.columns else "day_max"
         overrides = {}
         for _, r in win_df.iterrows():
             label = str(r.get(lcol, "")).strip()
@@ -85,10 +83,20 @@ def run() -> TierWriteResult:
         if overrides:
             set_window_overrides(overrides)
 
-    # HOT only; then A-tier filter happens inside rules.build_tier_a_pool
-    hot_pc  = rules.tag_window(load_candidates_for_window(SOURCE_PC, WINDOW_HOT, cfg.use_real_db, cfg.db_webview_pc or cfg.db_webview), WINDOW_HOT)
-    hot_mob = rules.tag_window(load_candidates_for_window(SOURCE_MOBILE, WINDOW_HOT, cfg.use_real_db, cfg.db_webview_mobile or cfg.db_webview), WINDOW_HOT)
+    # HOT only; then Tier-A filter
+    hot_pc  = rules.tag_window(
+        load_candidates_for_window(SOURCE_PC, WINDOW_HOT, cfg.use_real_db, cfg.db_webview_pc or cfg.db_webview),
+        WINDOW_HOT,
+    )
+    hot_mob = rules.tag_window(
+        load_candidates_for_window(SOURCE_MOBILE, WINDOW_HOT, cfg.use_real_db, cfg.db_webview_mobile or cfg.db_webview),
+        WINDOW_HOT,
+    )
     a_rows_raw = rules.build_tier_a_pool({WINDOW_HOT: [hot_pc, hot_mob]})
+
+    # ✅ Extra safeguard: only keep strict Tier A rows (label starts with "A")
+    if "tier" in a_rows_raw.columns:
+        a_rows_raw = a_rows_raw[a_rows_raw["tier"].astype(str).str.startswith("A")]
 
     # Read month file (for Compile) and central Blacklist
     month_info: SheetsInfo = sc.find_or_create_month_file("Tier A")
@@ -112,5 +120,12 @@ def run() -> TierWriteResult:
     df = build_tier_a_df(a_rows_f, ark_gem_col=cfg.ark_gem_column)
     res = _write(sc, "Tier A", df)
     if cfg.webhook_a:
-        notify_discord(cfg.webhook_a, tier_label="Tier A", file_name=res.file_name, tab_name=res.tab_name, row_count=res.row_count, sheet_url=res.sheet_url)
+        notify_discord(
+            cfg.webhook_a,
+            tier_label="Tier A",
+            file_name=res.file_name,
+            tab_name=res.tab_name,
+            row_count=res.row_count,
+            sheet_url=res.sheet_url,
+        )
     return res

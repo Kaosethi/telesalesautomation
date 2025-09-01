@@ -1,6 +1,6 @@
 # telesales/io_gsheets.py
 """
-Google Sheets / Drive helpers with a *forgiving* dry‑run mode.
+Google Sheets / Drive helpers with a *forgiving* dry-run mode.
 
 - If Google creds or required IDs are missing, we DO NOT crash.
   We log what we would have done and return placeholders.
@@ -24,7 +24,7 @@ from typing import Iterable, Optional, Tuple
 
 import pandas as pd
 
-# Third‑party Google libs (optional at import time)
+# Third-party Google libs (optional at import time)
 try:
     import gspread
     from gspread_dataframe import set_with_dataframe, get_as_dataframe
@@ -66,6 +66,9 @@ class SheetsClient:
         self.gc = None
         self.drive = None
 
+        # ✅ in-memory cache for read_tab_as_df
+        self._cache: dict[tuple[str, str], pd.DataFrame] = {}
+
         # Decide if we can do real work
         if not service_account_file:
             self._dry_run_reason = "missing GOOGLE_SERVICE_ACCOUNT_FILE"
@@ -105,7 +108,7 @@ class SheetsClient:
         print(f"[sheets] {msg}")
 
     def _log_dry_run(self, msg: str) -> None:
-        print(f"[sheets:DRY‑RUN] {msg}")
+        print(f"[sheets:DRY-RUN] {msg}")
 
     # -------------------------- naming helpers --------------------------------
 
@@ -195,12 +198,10 @@ class SheetsClient:
         sh = self.gc.open_by_key(spreadsheet_id)  # open spreadsheet
         existing = {ws.title for ws in sh.worksheets()}
 
-        # Create missing tabs
         for tab in required_tabs:
             if tab not in existing:
                 sh.add_worksheet(title=tab, rows="1000", cols="26")
 
-        # Re-order so "Compile" stays first if it exists
         if "Compile" in required_tabs and "Compile" in existing:
             try:
                 ws = sh.worksheet("Compile")
@@ -208,7 +209,6 @@ class SheetsClient:
             except Exception as e:
                 print(f"[sheets] reorder failed: {e}")
 
-        # Delete empty default tab "Sheet1" if still present
         if "Sheet1" in existing and len(sh.worksheets()) > len(required_tabs):
             try:
                 ws = sh.worksheet("Sheet1")
@@ -216,7 +216,6 @@ class SheetsClient:
                 print(f"[sheets] Deleted empty Sheet1 in {spreadsheet_id}")
             except Exception:
                 pass
-
 
     def write_df_to_tab(self, spreadsheet_id: str, tab_name: str, df: pd.DataFrame) -> None:
         """
@@ -244,44 +243,56 @@ class SheetsClient:
     def read_tab_as_df(self, spreadsheet_id: str, tab_name: str) -> pd.DataFrame:
         """
         Return the tab as a DataFrame.
-        If the tab exists but is empty (no header/rows), return an empty DataFrame.
+        Uses cache within one run to avoid repeat API calls.
         """
+        key = (spreadsheet_id, tab_name)
+        if key in self._cache:
+            return self._cache[key]
+
         if self.dry_run or spreadsheet_id in {"DRY-RUN", "UNKNOWN"}:
             self._log_dry_run(f"read_tab_as_df({tab_name}) -> empty df")
-            return pd.DataFrame()
+            df = pd.DataFrame()
+            self._cache[key] = df
+            return df
 
         if get_as_dataframe is None:
             self._log("gspread-dataframe not available; cannot read. Returning empty df.")
-            return pd.DataFrame()
+            df = pd.DataFrame()
+            self._cache[key] = df
+            return df
 
         try:
             sh = self.gc.open_by_key(spreadsheet_id)  # type: ignore
             try:
                 ws = sh.worksheet(tab_name)
             except Exception:
-                return pd.DataFrame()
+                df = pd.DataFrame()
+                self._cache[key] = df
+                return df
 
-            # Detect truly empty sheets (no values at all)
             values = ws.get_all_values()
             if not values or (len(values) == 1 and all(v == "" for v in values[0])):
-                return pd.DataFrame()
+                df = pd.DataFrame()
+                self._cache[key] = df
+                return df
 
-            # Parse with first row as header
             df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
             if df is None:
-                return pd.DataFrame()
+                df = pd.DataFrame()
 
-            # If header row was blank, pandas may create Unnamed columns — treat as empty
             col_names = [str(c) for c in df.columns]
             if not col_names or all(c.startswith("Unnamed:") for c in col_names):
-                return pd.DataFrame()
+                df = pd.DataFrame()
 
-            # Drop trailing all‑NaN rows that sometimes appear
-            return df.dropna(how="all")
+            df = df.dropna(how="all")
+            self._cache[key] = df
+            return df
 
         except Exception as e:
             self._log(f"read_tab_as_df error on '{tab_name}': {e}")
-            return pd.DataFrame()
+            df = pd.DataFrame()
+            self._cache[key] = df
+            return df
 
     def upsert_compile(self, spreadsheet_id: str, today_df: pd.DataFrame, assign_date_col: str = "Assign Date") -> None:
         """
@@ -299,7 +310,6 @@ class SheetsClient:
 
         compile_df = self.read_tab_as_df(spreadsheet_id, "Compile")
 
-        # If Assign Date is missing, just append raw
         if assign_date_col not in today_df.columns:
             self._log("Assign Date column missing in today_df; writing raw append to Compile.")
             new_df = pd.concat([compile_df, today_df], ignore_index=True)
@@ -309,10 +319,8 @@ class SheetsClient:
             if compile_df is not None and not compile_df.empty and assign_date_col in compile_df.columns:
                 mask = ~compile_df[assign_date_col].astype(str).isin(today_val_set)
                 kept = compile_df[mask]
-                # Align columns (union) to avoid column mismatch
                 new_df = pd.concat([kept, today_df], ignore_index=True)
             else:
-                # No existing Compile or no Assign Date column there — just use today's data
                 new_df = today_df.copy()
 
         self.write_df_to_tab(spreadsheet_id, "Compile", new_df)

@@ -4,12 +4,15 @@ import pandas as pd
 from dataclasses import dataclass
 from ..config import load_config
 from ..io_gsheets import SheetsClient, SheetsInfo
-from ..constants import SOURCE_PC, SOURCE_MOBILE, WINDOW_HOT, WINDOW_COLD, WINDOW_HIBERNATED, COL_ASSIGN_DATE
+from ..constants import (
+    SOURCE_PC, SOURCE_MOBILE,
+    WINDOW_HOT, WINDOW_COLD, WINDOW_HIBERNATED,
+    COL_ASSIGN_DATE,
+)
 from .. import rules, filters
 from ..utils import today_key
 from .build import build_non_a_df
 from ..loaders import load_candidates_for_window, set_window_overrides
-from ..assign import assign_mix_aware
 from ..notify import notify_discord
 
 @dataclass
@@ -21,6 +24,7 @@ class TierWriteResult:
     sheet_url: str
     spreadsheet_id: str
 
+
 def _write(sc: SheetsClient, label: str, df: pd.DataFrame) -> TierWriteResult:
     info: SheetsInfo = sc.find_or_create_month_file(label)
     day_tab = today_key()
@@ -29,25 +33,32 @@ def _write(sc: SheetsClient, label: str, df: pd.DataFrame) -> TierWriteResult:
     sc.upsert_compile(info.spreadsheet_id, df, assign_date_col=COL_ASSIGN_DATE)
     return TierWriteResult(label, info.title, day_tab, len(df), info.spreadsheet_url, info.spreadsheet_id)
 
+
 def _read_available_callers(sc: SheetsClient, config_sheet_id: str | None) -> list[str]:
     if not config_sheet_id:
         return []
     df = sc.read_tab_as_df(config_sheet_id, "Callers")
     if df is None or df.empty:
         return []
-    cols = {str(c).strip().lower(): c for c in df.columns}
-    name_col = cols.get("name") or cols.get("caller") or cols.get("telesale") or list(cols.values())[0]
-    avail_col = cols.get("available") or "available"
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    name_col = "name" if "name" in df.columns else df.columns[0]
+    avail_col = "available" if "available" in df.columns else None
 
     def _b(v):
+        try:
+            if pd.notna(v) and isinstance(v, (int, float)):
+                return float(v) != 0.0
+        except Exception:
+            pass
         s = str(v).strip().lower()
         return s in {"1", "1.0", "true", "t", "yes", "y"}
 
-    if avail_col not in df.columns:
+    if avail_col and avail_col in df.columns:
+        mask = df[avail_col].map(_b)
+        return df.loc[mask, name_col].dropna().astype(str).map(str.strip).tolist()
+    else:
         return df[name_col].dropna().astype(str).map(str.strip).tolist()
 
-    mask = df[avail_col].map(_b)
-    return df.loc[mask, name_col].dropna().astype(str).map(str.strip).tolist()
 
 def _read_mix_weights(sc: SheetsClient, config_sheet_id: str | None) -> dict[str, float]:
     if not config_sheet_id:
@@ -55,25 +66,46 @@ def _read_mix_weights(sc: SheetsClient, config_sheet_id: str | None) -> dict[str
     df = sc.read_tab_as_df(config_sheet_id, "Config")
     if df is None or df.empty:
         return {}
-    cols = {str(c).strip().lower(): c for c in df.columns if isinstance(c, str)}
-    sk_col = cols.get("source_key") or cols.get("source") or list(cols.values())[0]
-    en_col = cols.get("enabled") or "enabled"
-    mw_col = cols.get("mix_weight") or "mix_weight"
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    sk_col = "source_key" if "source_key" in df.columns else df.columns[0]
+    en_col = "enabled" if "enabled" in df.columns else None
+    mw_col = "mix_weight" if "mix_weight" in df.columns else None
 
-    def _b(v): return str(v).strip().lower() in {"1", "true", "yes", "y"}
+    def _b(v):
+        try:
+            if pd.notna(v) and isinstance(v, (int, float)):
+                return float(v) != 0.0
+        except Exception:
+            pass
+        s = str(v).strip().lower()
+        return s in {"1", "1.0", "true", "t", "yes", "y"}
 
-    if en_col in df.columns:
+    if en_col and en_col in df.columns:
         df = df[df[en_col].map(_b)]
-    if sk_col not in df.columns or mw_col not in df.columns:
+    if not mw_col or mw_col not in df.columns or sk_col not in df.columns:
         return {}
-
     ww = pd.to_numeric(df[mw_col], errors="coerce").fillna(0.0)
-    df = df.assign(**{mw_col: ww})
+    df[mw_col] = ww
     df = df[df[mw_col] > 0]
-
     weights = {str(r[sk_col]).strip(): float(r[mw_col]) for _, r in df[[sk_col, mw_col]].iterrows()}
     s = sum(weights.values()) or 1.0
     return {k: v / s for k, v in weights.items()}
+
+
+def assign_mix_balanced(df: pd.DataFrame, callers: list[str], per_caller_target: int, mix_weights: dict[str, float]) -> pd.DataFrame:
+    out = []
+    for source_key, weight in mix_weights.items():
+        subset = df[df["source_key"] == source_key].copy()
+        if subset.empty:
+            continue
+        needed = len(subset)
+        caller_cycle = (callers * ((needed // len(callers)) + 1))[:needed]
+        subset["telesale"] = caller_cycle
+        out.append(subset)
+    if out:
+        return pd.concat(out, ignore_index=True)
+    return df
+
 
 def run() -> TierWriteResult:
     cfg = load_config()
@@ -83,22 +115,21 @@ def run() -> TierWriteResult:
         output_prefix=cfg.output_prefix,
     )
 
-    # Holidays/weekend gate (RUN_DATE-aware)
+    # Holidays/weekend gate
     run_date_env = os.getenv("RUN_DATE")
     holidays_df = sc.read_tab_as_df(cfg.config_sheet_id, "Holidays") if cfg.config_sheet_id else pd.DataFrame()
     try:
         import pandas as _pd
-        target_day = _pd.to_datetime(run_date_env, format="%Y-%m-%d", errors="coerce").date() if run_date_env else _pd.Timestamp.today().date()
-
-        # Weekend skip
+        target_day = (
+            _pd.to_datetime(run_date_env, format="%Y-%m-%d", errors="coerce").date()
+            if run_date_env else _pd.Timestamp.today().date()
+        )
         if target_day.weekday() >= 5:
             print(f"[Non-A] weekend {target_day} — skipping")
             return TierWriteResult("Non A", "", today_key(), 0, "", "")
-
-        # Holidays sheet: presence of date implies holiday
         if holidays_df is not None and not holidays_df.empty:
-            cols = {str(c).strip().lower(): c for c in holidays_df.columns if isinstance(c, str)}
-            dcol = cols.get("date") or list(cols.values())[0]
+            holidays_df.columns = [str(c).strip().lower() for c in holidays_df.columns]
+            dcol = "date" if "date" in holidays_df.columns else holidays_df.columns[0]
             hd = holidays_df.copy()
             hd["_date"] = _pd.to_datetime(hd[dcol], format="%Y-%m-%d", errors="coerce").dt.date
             holidays_set = set(hd["_date"].dropna())
@@ -107,26 +138,6 @@ def run() -> TierWriteResult:
                 return TierWriteResult("Non A", "", today_key(), 0, "", "")
     except Exception as e:
         print(f"[Non-A] holiday check error: {e}")
-
-    # Windows overrides (from Config sheet)
-    win_df = sc.read_tab_as_df(cfg.config_sheet_id, "Windows") if cfg.config_sheet_id else pd.DataFrame()
-    if win_df is not None and not win_df.empty:
-        cols = {str(c).strip().lower(): c for c in win_df.columns if isinstance(c, str)}
-        lcol = cols.get("label") or list(cols.values())[0]
-        minc = cols.get("day_min") or "day_min"
-        maxc = cols.get("day_max") or "day_max"
-        overrides = {}
-        for _, r in win_df.iterrows():
-            label = str(r.get(lcol, "")).strip()
-            if not label:
-                continue
-            dmin = pd.to_numeric(r.get(minc, None), errors="coerce")
-            dmax = pd.to_numeric(r.get(maxc, None), errors="coerce")
-            dmin = int(dmin) if pd.notna(dmin) else 0
-            dmax_val = int(dmax) if pd.notna(dmax) else None
-            overrides[label] = (dmin, dmax_val)
-        if overrides:
-            set_window_overrides(overrides)
 
     # Pools
     hot_pc  = rules.tag_window(load_candidates_for_window(SOURCE_PC, WINDOW_HOT, cfg.use_real_db, cfg.db_webview_pc or cfg.db_webview), WINDOW_HOT)
@@ -138,20 +149,26 @@ def run() -> TierWriteResult:
 
     pools = {"Hot Lead": [hot_pc, hot_mob], "Cold": [cold_pc, cold_mob], "Hibernated": [hib_pc, hib_mob]}
 
-    # Build Non-A and filter using source-first selection
-    callers = _read_available_callers(sc, cfg.config_sheet_id)
-    per_caller = max(1, int(cfg.per_caller_target))
-    target_rows_non_a = len(callers) * per_caller if callers else 100000
+    print("[Non-A] pool sizes:",
+          f"Hot PC={len(hot_pc)}, Hot Mobile={len(hot_mob)}, "
+          f"Cold PC={len(cold_pc)}, Cold Mobile={len(cold_mob)}, "
+          f"Hibernated PC={len(hib_pc)}, Hibernated Mobile={len(hib_mob)}")
 
-    # Read month file (for Compile) and central Blacklist
-    month_info: SheetsInfo = sc.find_or_create_month_file("Non A")
-    compile_df = sc.read_tab_as_df(month_info.spreadsheet_id, "Compile") if month_info.spreadsheet_id else pd.DataFrame()
-    blacklist_df = sc.read_tab_as_df(cfg.config_sheet_id, "Blacklist") if cfg.config_sheet_id else pd.DataFrame()
-
-    # Mix weights for selection quotas
+    # Build raw pool
     mix_for_selection = _read_mix_weights(sc, cfg.config_sheet_id) or {"cabal_pc_th": 0.5, "cabal_mobile_th": 0.5}
+    non_a_raw, _ = rules.requery_non_a_source_first(pools, mix_for_selection, target_rows=100000)
 
-    non_a_raw, _ = rules.requery_non_a_source_first(pools, mix_for_selection, target_rows=target_rows_non_a)
+    # 🚫 Exclude Tier A strictly
+    if "tier" in non_a_raw.columns:
+        before = len(non_a_raw)
+        non_a_raw = non_a_raw[~non_a_raw["tier"].astype(str).str.startswith("A")]
+        after = len(non_a_raw)
+        print(f"[Non-A] dropped {before - after} Tier-A users from raw pool")
+
+    # Filters
+    month_info: SheetsInfo = sc.find_or_create_month_file("Non A")
+    compile_df = sc.read_tab_as_df(month_info.spreadsheet_id, "Compile")
+    blacklist_df = sc.read_tab_as_df(cfg.config_sheet_id, "Blacklist")
     non_a_f = filters.apply_filters(
         non_a_raw,
         compile_df=compile_df,
@@ -167,47 +184,27 @@ def run() -> TierWriteResult:
     )
 
     # Assignment
+    callers = _read_available_callers(sc, cfg.config_sheet_id)
+    per_caller = max(1, int(cfg.per_caller_target))
     if callers and not non_a_f.empty:
         mix = _read_mix_weights(sc, cfg.config_sheet_id) or {"cabal_pc_th": 0.5, "cabal_mobile_th": 0.5}
-        non_a_f = assign_mix_aware(non_a_f, callers=callers, per_caller_target=per_caller, mix_weights=mix)
+        non_a_f = assign_mix_balanced(non_a_f, callers=callers, per_caller_target=per_caller, mix_weights=mix)
 
-        # Safety: fill any blank telesale by round-robin to least-loaded callers
-        if "telesale" in non_a_f.columns:
-            counts = non_a_f[non_a_f["telesale"] != ""]["telesale"].value_counts().to_dict()
-            for c in callers:
-                counts.setdefault(c, 0)
-            blanks_idx = non_a_f.index[non_a_f["telesale"] == ""].tolist()
-            i = 0
-            while i < len(blanks_idx) and callers:
-                pick = min(callers, key=lambda c: counts.get(c, 0))
-                idx = blanks_idx[i]
-                non_a_f.at[idx, "telesale"] = pick
-                counts[pick] = counts.get(pick, 0) + 1
-                i += 1
+        # 🔍 Debug distribution
+        if "telesale" in non_a_f.columns and "source_key" in non_a_f.columns:
+            ct = non_a_f.groupby(["telesale", "source_key"]).size().unstack(fill_value=0)
+            print("[Non-A] per-caller distribution:\n", ct)
 
     df = build_non_a_df(non_a_f)
-    # Debug: quotas vs picked vs borrowed
-    try:
-        quotas = rules._hamilton_apportion_local(int(target_rows_non_a), rules._normalize_mix_local(mix_for_selection))
-        picked_by_source = {}
-        if "Source" in df.columns:
-            src_series = df["Source"].astype(str)
-        elif "platform" in df.columns:
-            src_series = df["platform"].astype(str)
-        elif "source_key" in df.columns:
-            src_series = df["source_key"].astype(str)
-        else:
-            src_series = pd.Series([], dtype=str)
-        for k, v in src_series.value_counts().to_dict().items():
-            picked_by_source[str(k)] = int(v)
-        keys = sorted(set(list(quotas.keys()) + list(picked_by_source.keys())))
-        borrowed = {k: max(0, picked_by_source.get(k, 0) - int(quotas.get(k, 0))) for k in keys}
-        def _fmt(d): return {k: int(d.get(k, 0)) for k in sorted(d.keys())}
-        print(f"[Non-A] selection quotas={_fmt(quotas)} picked={_fmt(picked_by_source)} borrowed={_fmt(borrowed)}")
-    except Exception:
-        pass
 
     res = _write(sc, "Non A", df)
     if cfg.webhook_non_a:
-        notify_discord(cfg.webhook_non_a, tier_label="Non-A", file_name=res.file_name, tab_name=res.tab_name, row_count=res.row_count, sheet_url=res.sheet_url)
+        notify_discord(
+            cfg.webhook_non_a,
+            tier_label="Non-A",
+            file_name=res.file_name,
+            tab_name=res.tab_name,
+            row_count=res.row_count,
+            sheet_url=res.sheet_url,
+        )
     return res
