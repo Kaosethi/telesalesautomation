@@ -77,31 +77,38 @@ def _read_mix_weights(sc: SheetsClient, config_sheet_id: str | None) -> dict[str
 
 def run() -> TierWriteResult:
     cfg = load_config()
-    sc = SheetsClient(service_account_file=cfg.service_account_file, output_folder_id=cfg.output_folder_id, output_prefix=cfg.output_prefix)
+    sc = SheetsClient(
+        service_account_file=cfg.service_account_file,
+        output_folder_id=cfg.output_folder_id,
+        output_prefix=cfg.output_prefix,
+    )
 
     # Holidays/weekend gate (RUN_DATE-aware)
     run_date_env = os.getenv("RUN_DATE")
     holidays_df = sc.read_tab_as_df(cfg.config_sheet_id, "Holidays") if cfg.config_sheet_id else pd.DataFrame()
     try:
         import pandas as _pd
-        target_day = _pd.to_datetime(run_date_env).date() if run_date_env else _pd.Timestamp.today().date()
+        target_day = _pd.to_datetime(run_date_env, format="%Y-%m-%d", errors="coerce").date() if run_date_env else _pd.Timestamp.today().date()
+
         # Weekend skip
         if target_day.weekday() >= 5:
             print(f"[Non-A] weekend {target_day} — skipping")
             return TierWriteResult("Non A", "", today_key(), 0, "", "")
+
         # Holidays sheet: presence of date implies holiday
         if holidays_df is not None and not holidays_df.empty:
             cols = {str(c).strip().lower(): c for c in holidays_df.columns if isinstance(c, str)}
             dcol = cols.get("date") or list(cols.values())[0]
             hd = holidays_df.copy()
-            hd["_date"] = _pd.to_datetime(hd[dcol], errors="coerce", dayfirst=True).dt.date
-            if (hd["_date"] == target_day).any():
-                print("[Non-A] holiday today — skipping")
+            hd["_date"] = _pd.to_datetime(hd[dcol], format="%Y-%m-%d", errors="coerce").dt.date
+            holidays_set = set(hd["_date"].dropna())
+            if target_day in holidays_set:
+                print(f"[Non-A] holiday {target_day} — skipping")
                 return TierWriteResult("Non A", "", today_key(), 0, "", "")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Non-A] holiday check error: {e}")
 
-    # Windows overrides (from Config sheet) — must happen before loading pools
+    # Windows overrides (from Config sheet)
     win_df = sc.read_tab_as_df(cfg.config_sheet_id, "Windows") if cfg.config_sheet_id else pd.DataFrame()
     if win_df is not None and not win_df.empty:
         cols = {str(c).strip().lower(): c for c in win_df.columns if isinstance(c, str)}
@@ -117,17 +124,16 @@ def run() -> TierWriteResult:
             dmax = pd.to_numeric(r.get(maxc, None), errors="coerce")
             dmin = int(dmin) if pd.notna(dmin) else 0
             dmax_val = int(dmax) if pd.notna(dmax) else None
-            # Canonicalization handled inside loaders.set_window_overrides
             overrides[label] = (dmin, dmax_val)
         if overrides:
             set_window_overrides(overrides)
 
     # Pools
-    hot_pc  = rules.tag_window(load_candidates_for_window(SOURCE_PC,     WINDOW_HOT,        cfg.use_real_db, cfg.db_webview_pc or cfg.db_webview), WINDOW_HOT)
-    hot_mob = rules.tag_window(load_candidates_for_window(SOURCE_MOBILE, WINDOW_HOT,        cfg.use_real_db, cfg.db_webview_mobile or cfg.db_webview), WINDOW_HOT)
-    cold_pc = rules.tag_window(load_candidates_for_window(SOURCE_PC,     WINDOW_COLD,       cfg.use_real_db, cfg.db_webview_pc or cfg.db_webview), WINDOW_COLD)
-    cold_mob= rules.tag_window(load_candidates_for_window(SOURCE_MOBILE, WINDOW_COLD,       cfg.use_real_db, cfg.db_webview_mobile or cfg.db_webview), WINDOW_COLD)
-    hib_pc  = rules.tag_window(load_candidates_for_window(SOURCE_PC,     WINDOW_HIBERNATED, cfg.use_real_db, cfg.db_webview_pc or cfg.db_webview), WINDOW_HIBERNATED)
+    hot_pc  = rules.tag_window(load_candidates_for_window(SOURCE_PC, WINDOW_HOT, cfg.use_real_db, cfg.db_webview_pc or cfg.db_webview), WINDOW_HOT)
+    hot_mob = rules.tag_window(load_candidates_for_window(SOURCE_MOBILE, WINDOW_HOT, cfg.use_real_db, cfg.db_webview_mobile or cfg.db_webview), WINDOW_HOT)
+    cold_pc = rules.tag_window(load_candidates_for_window(SOURCE_PC, WINDOW_COLD, cfg.use_real_db, cfg.db_webview_pc or cfg.db_webview), WINDOW_COLD)
+    cold_mob= rules.tag_window(load_candidates_for_window(SOURCE_MOBILE, WINDOW_COLD, cfg.use_real_db, cfg.db_webview_mobile or cfg.db_webview), WINDOW_COLD)
+    hib_pc  = rules.tag_window(load_candidates_for_window(SOURCE_PC, WINDOW_HIBERNATED, cfg.use_real_db, cfg.db_webview_pc or cfg.db_webview), WINDOW_HIBERNATED)
     hib_mob = rules.tag_window(load_candidates_for_window(SOURCE_MOBILE, WINDOW_HIBERNATED, cfg.use_real_db, cfg.db_webview_mobile or cfg.db_webview), WINDOW_HIBERNATED)
 
     pools = {"Hot Lead": [hot_pc, hot_mob], "Cold": [cold_pc, cold_mob], "Hibernated": [hib_pc, hib_mob]}
@@ -173,7 +179,6 @@ def run() -> TierWriteResult:
             blanks_idx = non_a_f.index[non_a_f["telesale"] == ""].tolist()
             i = 0
             while i < len(blanks_idx) and callers:
-                # pick least-loaded caller
                 pick = min(callers, key=lambda c: counts.get(c, 0))
                 idx = blanks_idx[i]
                 non_a_f.at[idx, "telesale"] = pick
@@ -181,10 +186,9 @@ def run() -> TierWriteResult:
                 i += 1
 
     df = build_non_a_df(non_a_f)
-    # Debug: quotas vs picked vs borrowed (approximate borrow = picked - quota if > 0)
+    # Debug: quotas vs picked vs borrowed
     try:
         quotas = rules._hamilton_apportion_local(int(target_rows_non_a), rules._normalize_mix_local(mix_for_selection))
-        # Count picked by source_key in the df we are about to write
         picked_by_source = {}
         if "Source" in df.columns:
             src_series = df["Source"].astype(str)
@@ -196,15 +200,13 @@ def run() -> TierWriteResult:
             src_series = pd.Series([], dtype=str)
         for k, v in src_series.value_counts().to_dict().items():
             picked_by_source[str(k)] = int(v)
-        # Align on known keys
         keys = sorted(set(list(quotas.keys()) + list(picked_by_source.keys())))
         borrowed = {k: max(0, picked_by_source.get(k, 0) - int(quotas.get(k, 0))) for k in keys}
-        # Build compact dicts for print
-        def _fmt(d):
-            return {k: int(d.get(k, 0)) for k in sorted(d.keys())}
+        def _fmt(d): return {k: int(d.get(k, 0)) for k in sorted(d.keys())}
         print(f"[Non-A] selection quotas={_fmt(quotas)} picked={_fmt(picked_by_source)} borrowed={_fmt(borrowed)}")
     except Exception:
         pass
+
     res = _write(sc, "Non A", df)
     if cfg.webhook_non_a:
         notify_discord(cfg.webhook_non_a, tier_label="Non-A", file_name=res.file_name, tab_name=res.tab_name, row_count=res.row_count, sheet_url=res.sheet_url)
