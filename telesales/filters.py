@@ -8,18 +8,15 @@ Inputs:
 - compile_df: current month's Compile (same tier), used to count statuses this month.
 - blacklist_df: central blacklist from the Config sheet: username, phone, source_key
 - redeemed_usernames_today: set[str] from Grafana (if enabled)
-
-Config toggles are passed in explicitly so this module stays stateless/testable.
 """
 
 from __future__ import annotations
 
-from typing import Iterable, Optional, Set, Tuple
+from typing import Iterable, Optional, Set
 import pandas as pd
 from .utils import today_key
 
-
-# ---- Thai status sets (as given) ---------------------------------------------
+# ---- Thai status sets ---------------------------------------------------------
 
 UNREACHABLE_ANS_STATUSES = {
     "ไม่รับสาย",         # no answer
@@ -45,12 +42,21 @@ def _safe_str_series(s: pd.Series) -> pd.Series:
     return s.astype(str).fillna("")
 
 
+def _normalize_phone_series(s: pd.Series) -> pd.Series:
+    """Strip leading zeros and decimals from phone numbers."""
+    return (
+        s.astype(str)
+        .str.replace(r"\.0$", "", regex=True)
+        .str.lstrip("0")
+        .str.strip()
+    )
+
+
 def _triple_key(df: pd.DataFrame) -> pd.Series:
     """(phone, username, source_key/platform) as a combined string key for fast matching."""
-    phone = _safe_str_series(df.get("phone", pd.Series()))
-    user = _safe_str_series(df.get("username", pd.Series()))
-    # some code uses "platform", some "source_key" — try both
-    src = _safe_str_series(df.get("source_key", df.get("platform", pd.Series())))
+    phone = _normalize_phone_series(df.get("phone", pd.Series(dtype=str)))
+    user = _safe_str_series(df.get("username", pd.Series(dtype=str)))
+    src = _safe_str_series(df.get("source_key", df.get("platform", pd.Series(dtype=str))))
     return phone + "|" + user + "|" + src
 
 
@@ -85,6 +91,8 @@ def apply_filters(
 
     keep = pd.Series(True, index=df.index)
 
+    dropped_blacklist = dropped_idempotent = dropped_unreachable = dropped_answered = dropped_not_interested = 0
+
     # --- Central blacklist (triple match) -------------------------------------
     if not bl.empty:
         bl_key = _triple_key(bl).unique()
@@ -92,19 +100,15 @@ def apply_filters(
         before = keep.sum()
         keep &= ~pool_key.isin(bl_key)
         dropped_blacklist = int(before - keep.sum())
-    else:
-        dropped_blacklist = 0
 
     # --- Compile-based rules (this month) -------------------------------------
     if not comp.empty:
-        # normalize text cols
         comp_ans = _safe_str_series(comp.get("Answer Status", pd.Series()))
         comp_res = _safe_str_series(comp.get("Result", pd.Series()))
         comp_user = _safe_str_series(comp.get("Username", comp.get("username", pd.Series())))
-        comp_phone = _safe_str_series(comp.get("Phone Number", comp.get("phone", pd.Series())))
+        comp_phone = _normalize_phone_series(comp.get("Phone Number", comp.get("phone", pd.Series())))
         comp_platform = _safe_str_series(comp.get("platform", comp.get("source_key", pd.Series())))
 
-        # Build a compact df to count by user+phone+platform this month
         comp_min = pd.DataFrame({
             "username": comp_user,
             "phone": comp_phone,
@@ -113,7 +117,6 @@ def apply_filters(
             "res": comp_res,
         })
 
-        # Today idempotency: drop candidates already assigned today
         comp_assign = _safe_str_series(comp.get("Assign Date", pd.Series()))
         today_str = today_key()
         if "Assign Date" in comp.columns:
@@ -132,7 +135,6 @@ def apply_filters(
         else:
             today_keys = set()
 
-        # Unreachable count ≥ N (this month)
         if drop_unreachable_repeat:
             unreachable_mask = comp_min["ans"].isin(UNREACHABLE_ANS_STATUSES)
             unreachable_counts = (
@@ -144,7 +146,6 @@ def apply_filters(
         else:
             unreachable_counts = pd.Series(dtype="int64")
 
-        # Answered-before (this month)
         if drop_answered_this_month:
             answered_keys = set(
                 comp_min.loc[comp_min["ans"] == ANSWERED_STATUS, ["username", "phone", "platform"]]
@@ -155,7 +156,6 @@ def apply_filters(
         else:
             answered_keys = set()
 
-        # Not interested (this month)
         if drop_not_interested_this_month:
             not_interested_keys = set(
                 comp_min.loc[comp_min["res"] == RESULT_NOT_INTERESTED, ["username", "phone", "platform"]]
@@ -166,22 +166,15 @@ def apply_filters(
         else:
             not_interested_keys = set()
 
-        # Build pool keys to match against Compile-derived sets
         pool_key = _triple_key(df)
 
-        # Today duplicates
         if today_keys:
             before = keep.sum()
             keep &= ~pool_key.isin(today_keys)
             dropped_idempotent = int(before - keep.sum())
-        else:
-            dropped_idempotent = 0
 
-        # Apply unreachable≥N
         if drop_unreachable_repeat and not unreachable_counts.empty:
-            # join counts onto df by (username, phone, platform)
             df3 = df.assign(_key=pool_key)
-            # explode unreachable_counts into a df for merge
             uc_df = unreachable_counts.reset_index().assign(
                 _key=lambda t: t["phone"].astype(str) + "|" + t["username"].astype(str) + "|" + t["platform"].astype(str)
             )[['_key', 'unreach_cnt']]
@@ -190,47 +183,34 @@ def apply_filters(
             before = keep.sum()
             keep &= df3["unreach_cnt"] < int(unreachable_min_count)
             dropped_unreachable = int(before - keep.sum())
-            print(f"[filters] dropped_unreachable={dropped_unreachable}")
-        else:
-            dropped_unreachable = 0
 
-        # Answered this month
         if drop_answered_this_month and answered_keys:
             before = keep.sum()
             keep &= ~pool_key.isin(answered_keys)
             dropped_answered = int(before - keep.sum())
-            print(f"[filters] dropped_answered={dropped_answered}")
-        else:
-            dropped_answered = 0
 
-        # Not interested this month
         if drop_not_interested_this_month and not_interested_keys:
             before = keep.sum()
             keep &= ~pool_key.isin(not_interested_keys)
             dropped_not_interested = int(before - keep.sum())
-        else:
-            dropped_not_interested = 0
 
-        # Debug print once with counters and date hints for idempotency
-        try:
-            uniq_assign = sorted(set(comp_assign.dropna().astype(str).unique().tolist()))[:5]
-            print(f"[filters] today={today_str} sample_assign={uniq_assign} drops idempotent={dropped_idempotent} unreachable={dropped_unreachable} answered={dropped_answered} not_interested={dropped_not_interested} blacklist={dropped_blacklist}")
-        except Exception:
-            pass
-
-    # --- Lifetime rules from past results (ever) -------------------------------
-    # These require looking at lifetime outcomes. Since we only have current-month Compile right now,
-    # we treat them as "drop if present in pool row already" or skip (until lifetime history available).
+    # --- Lifetime rules -------------------------------------------------------
     if drop_invalid_number and "Result" in df.columns:
         keep &= df["Result"].astype(str) != RESULT_INVALID_NUMBER
 
     if drop_not_owner_as_blacklist and "Result" in df.columns:
         keep &= df["Result"].astype(str) != RESULT_NOT_OWNER
 
-    # --- Redeemed today from Grafana ------------------------------------------
+    # --- Redeemed today from Grafana -----------------------------------------
     if drop_redeemed_today and redeemed_set:
-        # pool may use 'username' col
         keep &= ~df["username"].astype(str).isin(redeemed_set)
 
-    # Done
-    return df[keep].reset_index(drop=True)
+    # --- Final result with concise summary -----------------------------------
+    result = df[keep].reset_index(drop=True)
+    print(
+        f"[filters] {today_key()} drops: "
+        f"blacklist={dropped_blacklist}, idempotent={dropped_idempotent}, "
+        f"unreachable={dropped_unreachable}, answered={dropped_answered}, "
+        f"not_interested={dropped_not_interested} → kept={len(result)}/{len(df)}"
+    )
+    return result
