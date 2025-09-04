@@ -108,11 +108,40 @@ def build_non_a_pool(
 # --------------------------------------------------------------------------- #
 
 def _normalize_mix_local(weights: Dict[str, float]) -> Dict[str, float]:
-    cleaned = {str(k): float(v) for k, v in (weights or {}).items() if v is not None and float(v) > 0}
-    s = sum(cleaned.values())
-    if s <= 0:
-        return cleaned
-    return {k: v / s for k, v in cleaned.items()}
+    """
+    Normalize mix weights safely.
+    - If both are valid numbers, normalize so sum=1.
+    - If any weight is invalid/blank/non-numeric, fallback to 50/50.
+    - If both invalid, fallback to 50/50.
+    """
+    if not weights:
+        return {"cabal_pc_th": 0.5, "cabal_mobile_th": 0.5}
+
+    valid: Dict[str, float] = {}
+    invalid_found = False
+
+    for k, v in (weights or {}).items():
+        try:
+            f = float(v)
+            if f > 0:
+                valid[str(k)] = f
+            else:
+                invalid_found = True
+        except (TypeError, ValueError):
+            invalid_found = True
+
+    # If any invalid found or mismatch in count → strict fallback
+    if invalid_found or len(valid) != len(weights):
+        print("[config] Invalid mix_weight detected → fallback to 50/50")
+        return {"cabal_pc_th": 0.5, "cabal_mobile_th": 0.5}
+
+    # Normal case: both valid → normalize
+    total = sum(valid.values())
+    if total <= 0:
+        return {"cabal_pc_th": 0.5, "cabal_mobile_th": 0.5}
+
+    return {k: v / total for k, v in valid.items()}
+
 
 def _hamilton_apportion_local(total: int, weights: Dict[str, float]) -> Dict[str, int]:
     if total <= 0 or not weights:
@@ -134,6 +163,7 @@ def _hamilton_apportion_local(total: int, weights: Dict[str, float]) -> Dict[str
         leftover -= 1
         i += 1
     return base
+
 
 def _filter_by_source(df: pd.DataFrame, source_key: str) -> pd.DataFrame:
     if not isinstance(df, pd.DataFrame) or df.empty:

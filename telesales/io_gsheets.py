@@ -49,6 +49,88 @@ class SheetsInfo:
     title: str
 
 
+# ----------------------------- dropdown constants -----------------------------
+
+# Apply ONLY to Non-A spreadsheets:
+#   - Call Status @ column L (0-based index 11)
+#   - Result      @ column M (0-based index 12)
+
+CALL_STATUS_OPTIONS = [
+    "รับสาย",            # Answered
+    "ไม่รับสาย",          # Unreachable
+    "ติดต่อไม่ได้",        # Unreachable
+    "กดตัดสาย",           # Unreachable
+    "รับสายไม่สะดวกคุย",   # Unreachable
+]
+
+RESULT_OPTIONS = [
+    "เบอร์เสีย",          # Invalid number
+    "ไม่สนใจ",           # Not interested
+    "ไม่ใช่เจ้าของไอดี",  # Not owner (blacklist)
+]
+
+
+def apply_dropdown_validations(service, spreadsheet_id: str, sheet_id: int,
+                               call_status_col: int, result_col: int,
+                               max_rows: int = 5000) -> None:
+    """
+    Apply data validation dropdowns to Call Status and Result columns.
+    """
+    requests = []
+
+    # Call Status dropdown (col L)
+    requests.append({
+        "setDataValidation": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": 1,  # below header
+                "endRowIndex": max_rows,
+                "startColumnIndex": call_status_col,
+                "endColumnIndex": call_status_col + 1,
+            },
+            "rule": {
+                "condition": {
+                    "type": "ONE_OF_LIST",
+                    "values": [{"userEnteredValue": v} for v in CALL_STATUS_OPTIONS],
+                },
+                "inputMessage": "เลือกสถานะสายจากรายการ",
+                "strict": True,
+                "showCustomUi": True,
+            },
+        }
+    })
+
+    # Result dropdown (col M)
+    requests.append({
+        "setDataValidation": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": 1,
+                "endRowIndex": max_rows,
+                "startColumnIndex": result_col,
+                "endColumnIndex": result_col + 1,
+            },
+            "rule": {
+                "condition": {
+                    "type": "ONE_OF_LIST",
+                    "values": [{"userEnteredValue": v} for v in RESULT_OPTIONS],
+                },
+                "inputMessage": "เลือกผลลัพธ์จากรายการ",
+                "strict": True,
+                "showCustomUi": True,
+            },
+        }
+    })
+
+    body = {"requests": requests}
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body=body
+    ).execute()
+    print(f"[sheets] Applied dropdowns (Non-A) on sheet_id={sheet_id} "
+          f"CallStatusCol={call_status_col} ResultCol={result_col}")
+
+
 # ----------------------------- client -----------------------------------------
 
 class SheetsClient:
@@ -65,6 +147,7 @@ class SheetsClient:
         self._dry_run_reason: Optional[str] = None
         self.gc = None
         self.drive = None
+        self.service = None  # Sheets API for batchUpdate
 
         # ✅ in-memory cache for read_tab_as_df
         self._cache: dict[tuple[str, str], pd.DataFrame] = {}
@@ -88,6 +171,7 @@ class SheetsClient:
             creds = Credentials.from_service_account_file(service_account_file, scopes=scopes)
             self.gc = gspread.authorize(creds)
             self.drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+            self.service = build("sheets", "v4", credentials=creds, cache_discovery=False)
         except Exception as e:
             self._dry_run_reason = f"auth error: {e}"
             self._log_dry_run("auth error")
@@ -109,6 +193,29 @@ class SheetsClient:
 
     def _log_dry_run(self, msg: str) -> None:
         print(f"[sheets:DRY-RUN] {msg}")
+
+    # Detect Non-A spreadsheets by their title (e.g., "CBTH-NonA - 09-2025")
+    def _is_non_a_spreadsheet(self, sh) -> bool:
+        try:
+            title = (sh.title or "").lower()
+            return ("nona" in title) or ("non-a" in title) or ("non a" in title)
+        except Exception:
+            return False
+
+    # Apply dropdowns for Non-A only (columns L/M)
+    def _apply_non_a_dropdowns_if_applicable(self, sh, ws, spreadsheet_id: str) -> None:
+        if not self.service:
+            return
+        try:
+            if self._is_non_a_spreadsheet(sh):
+                apply_dropdown_validations(
+                    self.service, spreadsheet_id, ws.id,
+                    call_status_col=11,  # column L
+                    result_col=12,       # column M
+                    max_rows=5000
+                )
+        except Exception as e:
+            self._log(f"Dropdown apply failed: {e}")
 
     # -------------------------- naming helpers --------------------------------
 
@@ -195,12 +302,29 @@ class SheetsClient:
         return SheetsInfo("UNKNOWN", "https://docs.google.com", title)
 
     def ensure_tabs(self, spreadsheet_id: str, required_tabs: list[str]):
-        sh = self.gc.open_by_key(spreadsheet_id)  # open spreadsheet
+        """
+        Ensure required tabs exist in a spreadsheet.
+        Safe when Drive/Sheets are unavailable or the spreadsheet id is a placeholder.
+        """
+        # ✅ Guard: skip real API if we're in DRY-RUN or holding a placeholder id
+        if self.dry_run or spreadsheet_id in {"DRY-RUN", "UNKNOWN"}:
+            self._log_dry_run(f"ensure_tabs({required_tabs}) on {spreadsheet_id}")
+            return
+
+        try:
+            sh = self.gc.open_by_key(spreadsheet_id)  # open spreadsheet
+        except Exception as e:
+            self._log(f"ensure_tabs open_by_key failed for {spreadsheet_id}: {e}")
+            return
+
         existing = {ws.title for ws in sh.worksheets()}
 
         for tab in required_tabs:
             if tab not in existing:
-                sh.add_worksheet(title=tab, rows="1000", cols="26")
+                ws = sh.add_worksheet(title=tab, rows="1000", cols="26")
+                # Apply dropdowns only if this is a Non-A spreadsheet AND it's the Non-A Compile tab
+                if tab == "Compile" and self._is_non_a_spreadsheet(sh):
+                    self._apply_non_a_dropdowns_if_applicable(sh, ws, spreadsheet_id)
 
         if "Compile" in required_tabs and "Compile" in existing:
             try:
@@ -239,6 +363,10 @@ class SheetsClient:
 
         ws.clear()
         set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
+
+        # Apply dropdowns ONLY for Non-A spreadsheets (daily Non-A tab OR Non-A Compile)
+        if self._is_non_a_spreadsheet(sh):
+            self._apply_non_a_dropdowns_if_applicable(sh, ws, spreadsheet_id)
 
     def read_tab_as_df(self, spreadsheet_id: str, tab_name: str) -> pd.DataFrame:
         """
